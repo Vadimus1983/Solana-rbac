@@ -1,0 +1,24 @@
+[package]
+name = "rbac"
+version = "0.1.0"
+description = "On-chain Role-Based Access Control system for Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "rbac"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build"]
+
+[lints.rust]
+unexpected_cfgs = "allow"
+
+[dependencies]
+anchor-lang = { version = "0.32.0", features = ["init-if-needed"] }
+

@@ -1,0 +1,142 @@
+use anchor_lang::prelude::*;
+
+use crate::errors::RbacError;
+use crate::state::*;
+
+/// Recomputes `effective_permissions` for a batch of UserAccounts after structural
+/// changes (schema: Updating → commit → Recomputing). Role assignments/revocations
+/// in Idle state no longer require this batch.
+///
+/// remaining_accounts layout (repeated for each user in batch):
+///   - UserAccount (writable)
+///   - UserPermCache (writable)
+///   - RoleChunk_a (readonly), RoleChunk_b (readonly), ...  ← deduplicated per user
+///
+/// `user_chunk_counts[i]` = number of RoleChunk accounts following UserAccount+UserPermCache pair i.
+/// A user with no roles has user_chunk_counts[i] = 0.
+#[derive(Accounts)]
+pub struct ProcessRecomputeBatch<'info> {
+    #[account(
+        seeds = [b"organization", organization.name.as_bytes()],
+        bump = organization.bump,
+        constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
+    )]
+    pub organization: Account<'info, Organization>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+pub fn handler(
+    ctx: Context<ProcessRecomputeBatch>,
+    user_chunk_counts: Vec<u8>,
+) -> Result<()> {
+    let org = &ctx.accounts.organization;
+    require!(org.state == OrgState::Recomputing, RbacError::OrgNotRecomputing);
+
+    let target_version = org.permissions_version;
+    let org_key = org.key();
+    let remaining = &ctx.remaining_accounts;
+    let mut offset: usize = 0;
+
+    for &chunk_count in user_chunk_counts.iter() {
+        // Need at least UA + UPC.
+        require!(offset + 1 < remaining.len(), RbacError::AccountCountMismatch);
+
+        let ua_info = &remaining[offset];
+        let upc_info = &remaining[offset + 1];
+        offset += 2;
+
+        require!(ua_info.owner == ctx.program_id, RbacError::MissingAuthProof);
+        require!(ua_info.is_writable, RbacError::MissingAuthProof);
+        require!(upc_info.owner == ctx.program_id, RbacError::MissingAuthProof);
+        require!(upc_info.is_writable, RbacError::MissingAuthProof);
+
+        let cc = chunk_count as usize;
+        require!(offset + cc <= remaining.len(), RbacError::AccountCountMismatch);
+
+        // Slice of chunk accounts for this user.
+        let user_chunks = &remaining[offset..offset + cc];
+        offset += cc;
+
+        let mut ua = {
+            let data = ua_info
+                .try_borrow_data()
+                .map_err(|_| error!(RbacError::MissingAuthProof))?;
+            UserAccount::try_deserialize(&mut data.as_ref())
+                .map_err(|_| error!(RbacError::MissingAuthProof))?
+        };
+
+        require!(ua.organization == org_key, RbacError::MissingAuthProof);
+
+        // Recompute: direct_permissions ∪ each assigned role's effective_permissions.
+        let mut result = ua.direct_permissions.clone();
+        let mut new_versions: Vec<(u32, u64)> = Vec::with_capacity(ua.assigned_roles.len());
+
+        for role_ref in ua.assigned_roles.iter() {
+            let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;
+            let slot = role_ref.topo_index as usize % ROLES_PER_CHUNK;
+            let chunk = find_role_chunk_in_accounts(user_chunks, &org_key, chunk_idx, ctx.program_id)?;
+            let entry = &chunk.entries[slot];
+            if entry.active {
+                result = bitmask_union(&result, &entry.effective_permissions);
+            }
+            new_versions.push((role_ref.topo_index, entry.version));
+        }
+
+        for role_ref in ua.assigned_roles.iter_mut() {
+            if let Some(&(_, v)) = new_versions.iter().find(|(ti, _)| *ti == role_ref.topo_index) {
+                role_ref.last_seen_version = v;
+            }
+        }
+
+        ua.effective_permissions = result;
+        ua.cached_version = target_version;
+
+        let new_space = ua.current_size();
+        let rent = Rent::get()?;
+        let new_min = rent.minimum_balance(new_space);
+        let current_lamports = ua_info.lamports();
+        if current_lamports < new_min {
+            let diff = new_min - current_lamports;
+            let from = ctx.accounts.authority.to_account_info();
+            **from.try_borrow_mut_lamports()? -= diff;
+            **ua_info.try_borrow_mut_lamports()? += diff;
+        }
+        ua_info.resize(new_space)?;
+
+        let mut ua_data = ua_info
+            .try_borrow_mut_data()
+            .map_err(|_| error!(RbacError::MissingAuthProof))?;
+        let mut cursor = std::io::Cursor::new(ua_data.as_mut());
+        ua.try_serialize(&mut cursor)?;
+        drop(ua_data);
+
+        // Deserialize, update, and re-serialize the UserPermCache.
+        let mut cache = {
+            let data = upc_info
+                .try_borrow_data()
+                .map_err(|_| error!(RbacError::MissingAuthProof))?;
+            UserPermCache::try_deserialize(&mut data.as_ref())
+                .map_err(|_| error!(RbacError::MissingAuthProof))?
+        };
+
+        copy_to_fixed(&mut cache.effective_permissions, &ua.effective_permissions);
+        cache.effective_roles = [0u8; 32];
+        for rr in &ua.assigned_roles {
+            set_bit_arr(&mut cache.effective_roles, rr.topo_index);
+        }
+        cache.permissions_version = target_version;
+
+        let mut upc_data = upc_info
+            .try_borrow_mut_data()
+            .map_err(|_| error!(RbacError::MissingAuthProof))?;
+        let mut cursor = std::io::Cursor::new(upc_data.as_mut());
+        cache.try_serialize(&mut cursor)?;
+    }
+
+    require!(offset == remaining.len(), RbacError::AccountCountMismatch);
+    Ok(())
+}

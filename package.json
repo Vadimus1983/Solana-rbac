@@ -1,0 +1,19 @@
+{
+  "name": "solana-rbac",
+  "version": "0.1.0",
+  "description": "On-chain RBAC system for Solana — Superteam Bounty Submission",
+  "scripts": {
+    "test": "npx ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.32.0"
+  },
+  "devDependencies": {
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^10.0.0",
+    "chai": "^4.3.0",
+    "mocha": "^10.0.0",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^5.0.0"
+  }
+}
