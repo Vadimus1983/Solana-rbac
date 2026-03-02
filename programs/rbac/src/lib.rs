@@ -7,7 +7,7 @@ pub mod state;
 
 use instructions::*;
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf");
 
 #[program]
 pub mod rbac {
@@ -96,8 +96,8 @@ pub mod rbac {
         instructions::remove_child_role::handler(ctx, parent_index, child_index)
     }
 
-    pub fn recompute_role(ctx: Context<RecomputeRole>, role_index: u32) -> Result<()> {
-        instructions::recompute_role::handler(ctx, role_index)
+    pub fn recompute_role(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
+        instructions::recompute_role::handler(ctx, role_index, perm_chunk_count)
     }
 
     // ── Users ───────────────────────────────────────────────────────────
@@ -133,8 +133,9 @@ pub mod rbac {
     pub fn process_recompute_batch(
         ctx: Context<ProcessRecomputeBatch>,
         user_chunk_counts: Vec<u8>,
+        perm_chunk_count: u8,
     ) -> Result<()> {
-        instructions::process_recompute_batch::handler(ctx, user_chunk_counts)
+        instructions::process_recompute_batch::handler(ctx, user_chunk_counts, perm_chunk_count)
     }
 
     // ── Verification (read-only) ────────────────────────────────────────

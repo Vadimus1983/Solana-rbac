@@ -5,19 +5,18 @@ anchor_version = "0.32.0"
 resolution = true
 skip-lint = false
 
-[programs.localnet]
-rbac = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
-
 [programs.devnet]
 rbac = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+
+[programs.localnet]
+rbac = "H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
 test = "npx ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
-

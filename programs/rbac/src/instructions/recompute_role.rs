@@ -4,11 +4,16 @@ use crate::errors::RbacError;
 use crate::state::*;
 
 /// Recomputes a role's `effective_permissions` from its `direct_permissions`
-/// and the `effective_permissions` of all its direct children.
+/// (filtered to only active permissions) and the `effective_permissions` of
+/// all its direct children.
 ///
-/// Children in the SAME chunk as this role are read directly from `role_chunk`.
-/// Children in DIFFERENT chunks must be supplied in `remaining_accounts` as
-/// readonly RoleChunk accounts (deduplicated: one account per unique chunk).
+/// `perm_chunk_count` — number of PermChunk accounts at the START of
+/// `remaining_accounts` used to validate active status of direct permissions.
+/// Pass 0 if the role has no direct permissions.
+///
+/// remaining_accounts layout:
+///   [0 .. perm_chunk_count)  — readonly PermChunk accounts (deduplicated by chunk index)
+///   [perm_chunk_count ..)    — readonly RoleChunk accounts for cross-chunk children
 #[derive(Accounts)]
 #[instruction(role_index: u32)]
 pub struct RecomputeRole<'info> {
@@ -37,7 +42,7 @@ pub struct RecomputeRole<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<RecomputeRole>, role_index: u32) -> Result<()> {
+pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
     require!(
         ctx.accounts.organization.state == OrgState::Updating,
         RbacError::OrgNotInUpdateMode
@@ -55,16 +60,50 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32) -> Result<()> {
         require!(entry.active, RbacError::RoleInactive);
     }
 
-    // Clone data needed for computation to avoid borrow conflicts.
     let children: Vec<u32> = ctx.accounts.role_chunk.entries[slot].children.clone();
-    let mut result: Vec<u8> = ctx.accounts.role_chunk.entries[slot].direct_permissions.clone();
+    let direct_perms: Vec<u8> = ctx.accounts.role_chunk.entries[slot].direct_permissions.clone();
 
+    let pcc = perm_chunk_count as usize;
+    let perm_accounts = &ctx.remaining_accounts[..pcc];
+    let role_accounts = &ctx.remaining_accounts[pcc..];
+
+    // Build effective_permissions starting from direct_permissions,
+    // but only include bits whose corresponding PermEntry is still active.
+    let mut result: Vec<u8> = Vec::new();
+    for (byte_idx, &byte) in direct_perms.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        for bit in 0..8u32 {
+            if byte & (1 << bit) != 0 {
+                let perm_index = (byte_idx as u32) * 8 + bit;
+                let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+
+                let perm_chunk = find_perm_chunk_in_accounts(
+                    perm_accounts,
+                    &org_key,
+                    perm_chunk_idx,
+                    ctx.program_id,
+                )?;
+
+                if perm_slot < perm_chunk.entries.len()
+                    && perm_chunk.entries[perm_slot].index == perm_index
+                    && perm_chunk.entries[perm_slot].active
+                {
+                    set_bit(&mut result, perm_index);
+                }
+                // If inactive or not found in entries — bit is silently dropped.
+            }
+        }
+    }
+
+    // Union each child's effective_permissions into result.
     for &child_topo in &children {
         let child_chunk_idx = child_topo / ROLES_PER_CHUNK as u32;
         let child_slot = child_topo as usize % ROLES_PER_CHUNK;
 
         if child_chunk_idx == parent_chunk_idx {
-            // Child is in the same chunk — read it directly.
             let chunk = &ctx.accounts.role_chunk;
             if child_slot < chunk.entries.len() {
                 let child_entry = &chunk.entries[child_slot];
@@ -73,9 +112,8 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32) -> Result<()> {
                 }
             }
         } else {
-            // Child is in a different chunk — find it in remaining_accounts.
             let child_chunk = find_role_chunk_in_accounts(
-                ctx.remaining_accounts,
+                role_accounts,
                 &org_key,
                 child_chunk_idx,
                 ctx.program_id,

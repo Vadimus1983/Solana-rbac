@@ -6,3 +6,7 @@ dist
 test-ledger
 .yarn
 cli/dist
+/*.lock
+/.claude
+/admin/package-lock.json
+/package-lock.json

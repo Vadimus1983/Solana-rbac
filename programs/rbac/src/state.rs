@@ -413,6 +413,45 @@ pub fn copy_to_fixed(dest: &mut [u8; 32], src: &[u8]) {
 // Chunk lookup helper (used by multiple instructions)
 // ---------------------------------------------------------------------------
 
+/// Find and deserialize a PermChunk from a slice of AccountInfos, verifying its PDA.
+pub fn find_perm_chunk_in_accounts<'info>(
+    accounts: &[AccountInfo<'info>],
+    org_key: &Pubkey,
+    chunk_idx: u32,
+    program_id: &Pubkey,
+) -> Result<PermChunk> {
+    let chunk_idx_bytes = chunk_idx.to_le_bytes();
+    for ai in accounts.iter() {
+        if ai.owner != program_id {
+            continue;
+        }
+        let data = match ai.try_borrow_data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() < PermChunk::BASE_SIZE {
+            continue;
+        }
+        match PermChunk::try_deserialize(&mut &data[..]) {
+            Ok(chunk) if chunk.organization == *org_key && chunk.chunk_index == chunk_idx => {
+                let seeds: &[&[u8]] = &[
+                    b"perm_chunk",
+                    org_key.as_ref(),
+                    &chunk_idx_bytes,
+                    &[chunk.bump],
+                ];
+                if let Ok(derived) = Pubkey::create_program_address(seeds, program_id) {
+                    if derived == ai.key() {
+                        return Ok(chunk);
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+    err!(RbacError::ChunkNotFound)
+}
+
 /// Find and deserialize a RoleChunk from a slice of AccountInfos, verifying its PDA.
 ///
 /// Scans `accounts` for an account whose deserialized `chunk_index` matches

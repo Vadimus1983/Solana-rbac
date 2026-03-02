@@ -29,16 +29,23 @@ pub struct ProcessRecomputeBatch<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// remaining_accounts layout:
+///   [0 .. perm_chunk_count)  — readonly PermChunk accounts (for filtering direct_permissions)
+///   [perm_chunk_count ..)    — per-user groups: UA (writable), UPC (writable), RoleChunks...
 pub fn handler(
     ctx: Context<ProcessRecomputeBatch>,
     user_chunk_counts: Vec<u8>,
+    perm_chunk_count: u8,
 ) -> Result<()> {
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Recomputing, RbacError::OrgNotRecomputing);
 
     let target_version = org.permissions_version;
     let org_key = org.key();
-    let remaining = &ctx.remaining_accounts;
+
+    let pcc = perm_chunk_count as usize;
+    let perm_accounts = &ctx.remaining_accounts[..pcc];
+    let remaining = &ctx.remaining_accounts[pcc..];
     let mut offset: usize = 0;
 
     for &chunk_count in user_chunk_counts.iter() {
@@ -71,8 +78,41 @@ pub fn handler(
 
         require!(ua.organization == org_key, RbacError::MissingAuthProof);
 
-        // Recompute: direct_permissions ∪ each assigned role's effective_permissions.
-        let mut result = ua.direct_permissions.clone();
+        // Recompute: filter direct_permissions (active only) ∪ each assigned role's effective_permissions.
+        let mut result: Vec<u8> = Vec::new();
+
+        // Include only active direct permissions.
+        for (byte_idx, &byte) in ua.direct_permissions.iter().enumerate() {
+            if byte == 0 {
+                continue;
+            }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let perm_index = (byte_idx as u32) * 8 + bit;
+                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                    if pcc > 0 {
+                        let perm_chunk = find_perm_chunk_in_accounts(
+                            perm_accounts,
+                            &org_key,
+                            perm_chunk_idx,
+                            ctx.program_id,
+                        )?;
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut result, perm_index);
+                        }
+                        // inactive permission — silently dropped
+                    } else {
+                        // No perm chunks passed — include bit as-is.
+                        set_bit(&mut result, perm_index);
+                    }
+                }
+            }
+        }
+
         let mut new_versions: Vec<(u32, u64)> = Vec::with_capacity(ua.assigned_roles.len());
 
         for role_ref in ua.assigned_roles.iter() {
