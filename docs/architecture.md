@@ -504,34 +504,34 @@ sequenceDiagram
 sequenceDiagram
     actor Admin as Super Admin
     participant P as RBAC Program
-    participant RC as RoleChunk (writable)
-    participant PCs as PermChunk accounts (remaining[0..perm_chunk_count))
-    participant CRCs as Child RoleChunks (remaining[perm_chunk_count..))
+    participant RC as RoleChunk writable
+    participant PCs as PermChunks read-only
+    participant CRCs as Child RoleChunks read-only
 
     Admin->>P: recompute_role(role_index: 5, perm_chunk_count: 1)
-    Note right of Admin: remaining_accounts layout:<br/>[PC_0,          ← perm chunks (perm_chunk_count of them)<br/> RC_child_a, RC_child_b]  ← cross-chunk child roles
+    Note right of Admin: remaining_accounts - first perm_chunk_count PermChunks,<br/>then cross-chunk child RoleChunks
 
-    P->>RC: Load entry = entries[5 % 16]
-    P->>P: result = []
+    P->>RC: load entry at slot 5 mod 16
+    P->>P: result = empty bitmask
 
     loop For each set bit in entry.direct_permissions
-        P->>PCs: find PermChunk for this permission index
-        P->>P: if entry.active → set_bit(result, perm_index)
+        P->>PCs: find PermChunk for this perm_index
+        P->>P: if perm is active: set bit in result
         Note right of P: Inactive permissions silently dropped
     end
 
     loop For each child_topo in entry.children
-        P->>CRCs: find chunk by PDA derivation (or same chunk if same chunk_index)
-        P->>P: child_entry = chunk.entries[child_topo % 16]
-        P->>P: if active: result = bitmask_union(result, child_entry.effective_permissions)
+        P->>CRCs: find chunk by PDA derivation
+        P->>P: child_entry = chunk slot at child_topo mod 16
+        P->>P: if child_entry.active: union child effective_permissions into result
     end
 
     P->>RC: entry.effective_permissions = result
     P->>RC: entry.version += 1
-    P->>RC: realloc if effective grew
-    P-->>Admin: OK ✓
+    P->>RC: realloc if effective_permissions grew
+    P-->>Admin: OK
 
-    Note over RC: Cycle prevention: add_child_role enforces<br/>parent_index > child_index (topo ordering)<br/>Recompute children before parents (lowest index first)
+    Note over RC: add_child_role enforces parent_index greater than child_index<br/>Recompute leaves first - ascending topo_index order
 ```
 
 ### 5.6 process_recompute_batch (Recomputing state)
@@ -541,41 +541,41 @@ sequenceDiagram
     actor Admin as Super Admin
     participant P as RBAC Program
     participant Org as Organization PDA
-    participant PCs as PermChunk accounts (remaining[0..perm_chunk_count))
-    participant RAs as remaining_accounts[perm_chunk_count..)
+    participant PCs as PermChunks read-only
+    participant RAs as Per-user accounts
 
-    Admin->>P: process_recompute_batch(user_chunk_counts: [2, 1], perm_chunk_count: 1)
-    Note right of Admin: remaining_accounts layout:<br/>[PC_0,              ← perm_chunk_count PermChunks<br/> UA_1(mut), UPC_1(mut), RC_a, RC_b,<br/> UA_2(mut), UPC_2(mut), RC_a]
+    Admin->>P: process_recompute_batch(user_chunk_counts, perm_chunk_count)
+    Note right of Admin: remaining_accounts - first perm_chunk_count PermChunks,<br/>then per-user groups: UA writable, UPC writable, RoleChunks
 
     P->>Org: Verify state == Recomputing
 
-    loop For each user (chunk counts [2, 1])
-        P->>RAs: Read UserAccount (writable)
-        P->>RAs: Read UserPermCache (writable)
-        P->>P: result = []
+    loop For each user in the batch
+        P->>RAs: read UserAccount writable
+        P->>RAs: read UserPermCache writable
+        P->>P: result = empty bitmask
 
         loop For each set bit in user.direct_permissions
-            P->>PCs: find PermChunk; if active → set_bit(result, perm_index)
+            P->>PCs: find PermChunk, set bit in result if perm active
         end
 
         loop For each RoleRef in user.assigned_roles
             P->>RAs: find matching RoleChunk by PDA
-            loop For each set bit in entry.effective_permissions
-                P->>PCs: if active → set_bit(result, perm_index)
+            loop For each set bit in role.effective_permissions
+                P->>PCs: if perm active: set bit in result
             end
-            P->>P: ref.last_seen_version = entry.version
+            P->>P: update ref.last_seen_version
         end
 
         P->>RAs: user.effective_permissions = result
         P->>RAs: user.cached_version = org.permissions_version
-        P->>RAs: UPC.effective_permissions = result (fixed [u8;32])
+        P->>RAs: UPC.effective_permissions = result as fixed 32-byte array
         P->>RAs: UPC.effective_roles = bitmask of assigned topo_indices
         P->>RAs: UPC.permissions_version = org.permissions_version
     end
 
-    P-->>Admin: OK ✓
+    P-->>Admin: OK
 
-    Note over PCs,RAs: Inactive permissions are filtered out in both<br/>direct_permissions and role effective_permissions.<br/>Deleted perms are silently dropped even if still set in bitmasks.
+    Note over PCs,RAs: Inactive permissions filtered from both direct and role bitmasks.<br/>Deleted perms silently dropped even if still set on-chain.
 ```
 
 ### 5.7 has_permission (Idle — free off-chain, on-chain via CPI)
