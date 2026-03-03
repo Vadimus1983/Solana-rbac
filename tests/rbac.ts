@@ -563,9 +563,10 @@ describe("rbac", () => {
   // Step 13 — Revoke Bob's editor role in Idle state (no batch recompute needed)
   // -------------------------------------------------------------------------
   it("Step 13: Alice revokes Bob's editor role (Idle state)", async () => {
-    // Bob has no remaining roles after revocation, so 0 chunk accounts.
+    // Bob has no remaining roles after revocation and no direct permissions, so
+    // perm_chunk_count=0 and no chunk accounts needed.
     await program.methods
-      .revokeRole(editorRoleIdx)
+      .revokeRole(editorRoleIdx, 0)
       .accounts({
         userAccount: bobUaPda,
         userPermCache: bobUpcPda,
@@ -573,7 +574,7 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([])  // no remaining roles → no chunks needed
+      .remainingAccounts([])  // no remaining roles, no perm chunks → no chunks needed
       .rpc();
 
     const ua = await program.account.userAccount.fetch(bobUaPda);
@@ -1028,7 +1029,7 @@ describe("rbac", () => {
     // carol tries to revoke dave's viewer role using her attack_org cache.
     try {
       await program.methods
-        .revokeRole(viewerRoleIdx)
+        .revokeRole(viewerRoleIdx, 0)  // pcc=0: no perm chunks (will fail at auth check first)
         .accounts({
           userAccount: daveUaPda,
           userPermCache: daveUpcPda,
@@ -1116,8 +1117,9 @@ describe("rbac", () => {
     );
 
     // Clean up: revoke dave's viewer role so we can re-assign it via delegation.
+    // dave has no direct permissions at this point → pcc=0.
     await program.methods
-      .revokeRole(viewerRoleIdx)
+      .revokeRole(viewerRoleIdx, 0)
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1160,6 +1162,288 @@ describe("rbac", () => {
     assert.ok(
       hasBit(daveCache.effectivePermissions as number[], readPermIdx),
       "dave should have read permission from viewer role"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Security: Issue #2 — revoke_role / revoke_user_permission resurrect
+  //           soft-deleted permissions from stale direct_permissions bits
+  //
+  // Before the fix, both handlers started the recompute from
+  // `ua.direct_permissions.clone()` directly. After a permission is
+  // soft-deleted and processRecomputeBatch has run, direct_permissions still
+  // retains the stale bit (only effective_permissions is cleaned). A subsequent
+  // revokeRole or revokeUserPermission call would then copy that stale bit into
+  // effective_permissions, effectively resurrecting the deleted permission.
+  //
+  // Fix: both handlers accept perm_chunk_count: u8 and split remaining_accounts
+  // into [perm_chunks (0..pcc), role_chunks (pcc..)]. direct_permissions bits
+  // are filtered through the supplied PermChunks — inactive bits are dropped.
+  //
+  // Tests:
+  //   Setup: create temp_perm (index 4), assign it to dave, soft-delete it,
+  //          run processRecomputeBatch → dave.direct_permissions has stale bit 4
+  //          but dave.effective_permissions does NOT.
+  //   A. revokeRole:            stale bit 4 is NOT resurrected
+  //   B. revokeUserPermission:  stale bit 4 is NOT resurrected
+  // ---------------------------------------------------------------------------
+
+  let tempPermIdx: number; // will be 4 (nextPermissionIndex after issue #1 tests)
+
+  it("Issue #2 setup: create temp_perm, assign to dave, soft-delete it", async () => {
+    // Phase 1: create temp_perm (next index in acme_corp after the issue #1 cycle).
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await program.methods
+      .createPermission("temp_perm", "Temporary permission for Issue #2 test")
+      .accounts({
+        permChunk: permChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Empty batch: no user's effective_permissions are affected by a newly
+    // created permission that nobody holds yet.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const org = await program.account.organization.fetch(orgPda);
+    tempPermIdx = (org.nextPermissionIndex as number) - 1;
+
+    // Phase 2: assign temp_perm to dave directly (Idle state).
+    await program.methods
+      .assignUserPermission(tempPermIdx)
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    {
+      const ua = await program.account.userAccount.fetch(daveUaPda);
+      assert.ok(
+        hasBit(ua.directPermissions as number[], tempPermIdx),
+        "dave should have temp_perm in direct_permissions"
+      );
+      assert.ok(
+        hasBit(ua.effectivePermissions as number[], tempPermIdx),
+        "dave should have temp_perm in effective_permissions"
+      );
+    }
+
+    // Phase 3: soft-delete temp_perm and run processRecomputeBatch for dave.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await program.methods
+      .deletePermission(tempPermIdx)
+      .accounts({
+        permChunk: permChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .rpc();
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Process dave: perm_chunk_count=1 so the handler filters his stale
+    // direct_permissions bit through permChunk0 and drops the inactive bit.
+    // dave has 1 role (viewer → chunk 0) → user_chunk_counts=[1].
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1]), 1)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda,  isWritable: false, isSigner: false }, // perm chunk (pcc=1)
+        { pubkey: daveUaPda,      isWritable: true,  isSigner: false }, // dave UA
+        { pubkey: daveUpcPda,     isWritable: true,  isSigner: false }, // dave UPC
+        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false }, // viewer in chunk 0
+      ])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Verify the expected stale state: direct_permissions still has bit tempPermIdx
+    // but effective_permissions does NOT (it was filtered out by processRecomputeBatch).
+    const ua = await program.account.userAccount.fetch(daveUaPda);
+    assert.ok(
+      hasBit(ua.directPermissions as number[], tempPermIdx),
+      "stale bit should remain in direct_permissions (processRecomputeBatch never clears it)"
+    );
+    assert.ok(
+      !hasBit(ua.effectivePermissions as number[], tempPermIdx),
+      "stale bit should NOT be in effective_permissions after processRecomputeBatch"
+    );
+    assert.ok(
+      hasBit(ua.effectivePermissions as number[], readPermIdx),
+      "dave should still have read from viewer role"
+    );
+  });
+
+  it("Issue #2 fix (revoke_role): stale direct_permissions bit is NOT resurrected", async () => {
+    // dave has: viewer role (0), stale bit tempPermIdx in direct_permissions.
+    // Revoke the viewer role, supplying permChunk0 so the handler can filter
+    // the stale bit. dave has no remaining roles → no role chunks needed.
+    await program.methods
+      .revokeRole(viewerRoleIdx, 1)  // perm_chunk_count=1
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false }, // perm chunk (pcc=1)
+        // no role chunk accounts — dave has no remaining roles
+      ])
+      .rpc();
+
+    const ua = await program.account.userAccount.fetch(daveUaPda);
+
+    // Viewer role should be gone.
+    assert.equal(ua.assignedRoles.length, 0, "dave should have no roles after revokeRole");
+
+    // Issue #2: stale bit must NOT appear in effective_permissions.
+    assert.ok(
+      !hasBit(ua.effectivePermissions as number[], tempPermIdx),
+      "Issue #2 (revoke_role): stale direct_permissions bit must NOT be resurrected in effective_permissions"
+    );
+
+    // Read perm (came from viewer role) should also be gone.
+    assert.ok(
+      !hasBit(ua.effectivePermissions as number[], readPermIdx),
+      "read perm should be gone (viewer role was revoked)"
+    );
+
+    // Verify cache is also clean.
+    const cache = await (program.account as any).userPermCache.fetch(daveUpcPda);
+    assert.ok(
+      !hasBit(cache.effectivePermissions as number[], tempPermIdx),
+      "cache: stale bit must NOT be resurrected"
+    );
+    assert.ok(
+      !hasBit(cache.effectiveRoles as number[], viewerRoleIdx),
+      "cache: viewer role bit should be cleared"
+    );
+  });
+
+  it("Issue #2 fix (revoke_user_permission): stale direct_permissions bit is NOT resurrected", async () => {
+    // Setup: re-assign viewer role to dave and give him an active direct perm (read/0).
+    // After this, dave has:
+    //   assignedRoles:      [viewer (0)]
+    //   directPermissions:  stale bit tempPermIdx + active bit readPermIdx
+    //   effectivePermissions: bit readPermIdx (viewer already provides it)
+
+    await program.methods
+      .assignRole(viewerRoleIdx)
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        roleChunk: roleChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    await program.methods
+      .assignUserPermission(readPermIdx)
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    {
+      const ua = await program.account.userAccount.fetch(daveUaPda);
+      assert.ok(hasBit(ua.directPermissions as number[], readPermIdx), "dave should have read in direct_permissions");
+      assert.ok(hasBit(ua.directPermissions as number[], tempPermIdx), "stale bit should still be in direct_permissions");
+    }
+
+    // Revoke read perm (0) from dave.
+    // remaining_accounts layout: [permChunk0 (pcc=1), roleChunk0 (remaining roles)]
+    await program.methods
+      .revokeUserPermission(readPermIdx, 1)  // perm_chunk_count=1
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false }, // perm chunk (pcc=1)
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false }, // viewer role chunk
+      ])
+      .rpc();
+
+    const ua = await program.account.userAccount.fetch(daveUaPda);
+
+    // Issue #2: stale bit must NOT appear in effective_permissions.
+    assert.ok(
+      !hasBit(ua.effectivePermissions as number[], tempPermIdx),
+      "Issue #2 (revoke_user_permission): stale direct_permissions bit must NOT be resurrected in effective_permissions"
+    );
+
+    // Read perm should still be in effective_permissions — it comes from the
+    // viewer role, not from the revoked direct assignment.
+    assert.ok(
+      hasBit(ua.effectivePermissions as number[], readPermIdx),
+      "read perm should still be in effective_permissions (contributed by viewer role)"
+    );
+
+    // The revoked bit should be cleared from direct_permissions.
+    assert.ok(
+      !hasBit(ua.directPermissions as number[], readPermIdx),
+      "read bit should be cleared from direct_permissions after revokeUserPermission"
+    );
+
+    // Stale bit remains in direct_permissions (by design — only processRecomputeBatch cleans it).
+    assert.ok(
+      hasBit(ua.directPermissions as number[], tempPermIdx),
+      "stale bit remains in direct_permissions (cleanup is deferred to processRecomputeBatch)"
+    );
+
+    // Verify cache.
+    const cache = await (program.account as any).userPermCache.fetch(daveUpcPda);
+    assert.ok(
+      !hasBit(cache.effectivePermissions as number[], tempPermIdx),
+      "cache: stale bit must NOT appear in effective_permissions"
+    );
+    assert.ok(
+      hasBit(cache.effectivePermissions as number[], readPermIdx),
+      "cache: read perm should be present (from viewer role)"
     );
   });
 });

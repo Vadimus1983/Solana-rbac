@@ -9,8 +9,12 @@ use crate::state::*;
 /// from the remaining direct_permissions plus all assigned roles.
 /// Also updates UserPermCache.
 ///
-/// remaining_accounts: deduplicated RoleChunk accounts for all roles assigned
-/// to this user (readonly). If user has no roles, pass an empty slice.
+/// `perm_chunk_count` — number of PermChunk accounts at the START of
+/// `remaining_accounts`, used to filter inactive bits still present in
+/// `direct_permissions` after the clear (Issue #2 fix).
+///
+/// remaining_accounts layout:
+///   [perm_chunks (0..pcc), role_chunks (pcc..)]
 #[derive(Accounts)]
 pub struct RevokeUserPermission<'info> {
     #[account(
@@ -47,7 +51,7 @@ pub struct RevokeUserPermission<'info> {
     pub authority: Signer<'info>,
 }
 
-pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32) -> Result<()> {
+pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32, perm_chunk_count: u8) -> Result<()> {
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
 
@@ -57,8 +61,44 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32) -> Res
     let ua = &mut ctx.accounts.user_account;
     clear_bit(&mut ua.direct_permissions, permission_index);
 
-    // Full recompute: direct_permissions (with bit cleared) ∪ all role effective_permissions.
-    let mut result = ua.direct_permissions.clone();
+    let pcc = perm_chunk_count as usize;
+    let perm_accounts = &ctx.remaining_accounts[..pcc];
+    let role_accounts = &ctx.remaining_accounts[pcc..];
+
+    // Full recompute: filter direct_permissions (post-clear) through PermChunks
+    // (Issue #2 fix — stale bits from soft-deleted permissions are dropped),
+    // then union each assigned role's effective_permissions.
+    let mut result: Vec<u8> = Vec::new();
+    for (byte_idx, &byte) in ua.direct_permissions.iter().enumerate() {
+        if byte == 0 { continue; }
+        for bit in 0..8u32 {
+            if byte & (1 << bit) != 0 {
+                let perm_index = (byte_idx as u32) * 8 + bit;
+                if pcc > 0 {
+                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                    if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
+                        perm_accounts,
+                        &org_key,
+                        perm_chunk_idx,
+                        ctx.program_id,
+                    ) {
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut result, perm_index);
+                        }
+                        // inactive or not in entries → bit silently dropped
+                    }
+                    // chunk not in accounts → treat as inactive, drop bit
+                } else {
+                    // pcc == 0: no perm chunks supplied — include bit as-is.
+                    set_bit(&mut result, perm_index);
+                }
+            }
+        }
+    }
 
     let roles_snapshot: Vec<RoleRef> = ua.assigned_roles.clone();
     let mut new_versions: Vec<(u32, u64)> = Vec::with_capacity(roles_snapshot.len());
@@ -67,7 +107,7 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32) -> Res
         let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;
         let slot = role_ref.topo_index as usize % ROLES_PER_CHUNK;
         let chunk = find_role_chunk_in_accounts(
-            ctx.remaining_accounts,
+            role_accounts,
             &org_key,
             chunk_idx,
             ctx.program_id,

@@ -131,7 +131,7 @@ export default function Users({
       .filter((i) => i !== roleIndex);
     const program = getProgram(connection, wallet);
     const ok = await run(`Revoke Role #${roleIndex}`, () =>
-      txRevokeRole(program, orgName, userData.user, roleIndex, remainingRoles, wallet.publicKey!)
+      txRevokeRole(program, orgName, userData.user, roleIndex, remainingRoles, userData.directPermissions, wallet.publicKey!)
     );
     if (ok) await refreshUser();
   };
@@ -150,7 +150,7 @@ export default function Users({
     const assignedRoleIndices = userData.assignedRoles.map((r) => r.topoIndex);
     const program = getProgram(connection, wallet);
     const ok = await run(`Revoke Permission #${permIndex}`, () =>
-      txRevokeUserPermission(program, orgName, userData.user, permIndex, assignedRoleIndices, wallet.publicKey!)
+      txRevokeUserPermission(program, orgName, userData.user, permIndex, assignedRoleIndices, userData.directPermissions, wallet.publicKey!)
     );
     if (ok) await refreshUser();
   };

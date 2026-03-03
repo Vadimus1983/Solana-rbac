@@ -110,8 +110,8 @@ pub mod rbac {
         instructions::assign_role::handler(ctx, role_index)
     }
 
-    pub fn revoke_role(ctx: Context<RevokeRole>, role_index: u32) -> Result<()> {
-        instructions::revoke_role::handler(ctx, role_index)
+    pub fn revoke_role(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
+        instructions::revoke_role::handler(ctx, role_index, perm_chunk_count)
     }
 
     pub fn assign_user_permission(
@@ -124,8 +124,9 @@ pub mod rbac {
     pub fn revoke_user_permission(
         ctx: Context<RevokeUserPermission>,
         permission_index: u32,
+        perm_chunk_count: u8,
     ) -> Result<()> {
-        instructions::revoke_user_permission::handler(ctx, permission_index)
+        instructions::revoke_user_permission::handler(ctx, permission_index, perm_chunk_count)
     }
 
     // ── Batch recompute ─────────────────────────────────────────────────

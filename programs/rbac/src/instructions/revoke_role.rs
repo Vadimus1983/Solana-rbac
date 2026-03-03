@@ -52,15 +52,22 @@ pub struct RevokeRole<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<RevokeRole>, role_index: u32) -> Result<()> {
+/// `perm_chunk_count` — number of PermChunk accounts at the START of the
+/// caller-controlled portion of `remaining_accounts`, used to filter inactive
+/// bits from `direct_permissions` (Issue #2 fix).
+///
+/// remaining_accounts layout:
+///   super_admin path: [perm_chunks (0..pcc), role_chunks (pcc..)]
+///   delegated path:   [caller_cache (0), perm_chunks (1..1+pcc), role_chunks (1+pcc..)]
+pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
 
     let org_key = org.key();
     let org_permissions_version = org.permissions_version;
 
-    // Authorization check and determine offset into remaining_accounts for chunks.
-    let chunks_offset: usize;
+    // Authorization check; determine where perm_chunks start in remaining_accounts.
+    let base_offset: usize;
     if ctx.accounts.authority.key() != org.super_admin {
         require!(!ctx.remaining_accounts.is_empty(), RbacError::NotSuperAdmin);
 
@@ -89,12 +96,14 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32) -> Result<()> {
             has_bit(&caller_cache.effective_permissions, MANAGE_ROLES_PERMISSION_INDEX),
             RbacError::InsufficientPermission
         );
-        chunks_offset = 1;
+        base_offset = 1;
     } else {
-        chunks_offset = 0;
+        base_offset = 0;
     }
 
-    let role_chunks = &ctx.remaining_accounts[chunks_offset..];
+    let pcc = perm_chunk_count as usize;
+    let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
+    let role_chunks = &ctx.remaining_accounts[base_offset + pcc..];
 
     let ua = &mut ctx.accounts.user_account;
 
@@ -103,10 +112,42 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32) -> Result<()> {
     require!(pos.is_some(), RbacError::RoleNotAssigned);
     ua.assigned_roles.swap_remove(pos.unwrap());
 
-    // Full recompute: direct_permissions ∪ each remaining role's effective_permissions.
-    let mut result = ua.direct_permissions.clone();
+    // Full recompute: filter direct_permissions through PermChunks (Issue #2 fix —
+    // stale bits from soft-deleted permissions are dropped), then union each
+    // remaining role's effective_permissions.
+    let mut result: Vec<u8> = Vec::new();
+    for (byte_idx, &byte) in ua.direct_permissions.iter().enumerate() {
+        if byte == 0 { continue; }
+        for bit in 0..8u32 {
+            if byte & (1 << bit) != 0 {
+                let perm_index = (byte_idx as u32) * 8 + bit;
+                if pcc > 0 {
+                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                    if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
+                        perm_accounts,
+                        &org_key,
+                        perm_chunk_idx,
+                        ctx.program_id,
+                    ) {
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut result, perm_index);
+                        }
+                        // inactive or not in entries → bit silently dropped
+                    }
+                    // chunk not in accounts → treat as inactive, drop bit
+                } else {
+                    // pcc == 0: no perm chunks supplied — include bit as-is.
+                    set_bit(&mut result, perm_index);
+                }
+            }
+        }
+    }
 
-    // Collect new versions while computing.
+    // Collect new versions while computing role union.
     let mut new_versions: Vec<(u32, u64)> = Vec::with_capacity(ua.assigned_roles.len());
     for role_ref in ua.assigned_roles.iter() {
         let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;

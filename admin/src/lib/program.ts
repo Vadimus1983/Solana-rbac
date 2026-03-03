@@ -591,22 +591,35 @@ export async function txRevokeRole(
   userKey: PublicKey,
   roleIndex: number,
   remainingRoleIndices: number[], // all roles the user will still have after revoke
+  directPermissions: Uint8Array,  // user's current direct_permissions bitmask
   authority: PublicKey
 ): Promise<string> {
   const [orgPda] = findOrgPda(orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
 
-  // Unique chunks for all remaining roles
-  const uniqueChunkIndices = new Set(remainingRoleIndices.map(roleChunkIndex));
-  const remainingAccounts: AccountMeta[] = [];
-  for (const ci of uniqueChunkIndices) {
-    const [pda] = findRoleChunkPda(orgPda, ci);
-    remainingAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
+  // Perm chunks for filtering direct_permissions (Issue #2 fix — first in remaining_accounts)
+  const uniquePermChunkIndices = new Set(
+    bitmaskToIndices(directPermissions).map(permChunkIndex)
+  );
+  const permChunkAccounts: AccountMeta[] = [];
+  for (const ci of uniquePermChunkIndices) {
+    const [pda] = findPermChunkPda(orgPda, ci);
+    permChunkAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
   }
 
+  // Role chunks for all remaining roles (after perm chunks)
+  const uniqueRoleChunkIndices = new Set(remainingRoleIndices.map(roleChunkIndex));
+  const roleChunkAccounts: AccountMeta[] = [];
+  for (const ci of uniqueRoleChunkIndices) {
+    const [pda] = findRoleChunkPda(orgPda, ci);
+    roleChunkAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
+  }
+
+  const remainingAccounts: AccountMeta[] = [...permChunkAccounts, ...roleChunkAccounts];
+
   return (program.methods as any)
-    .revokeRole(roleIndex)
+    .revokeRole(roleIndex, permChunkAccounts.length)
     .accounts({
       userAccount: userAccountPda,
       userPermCache: userPermCachePda,
@@ -646,22 +659,39 @@ export async function txRevokeUserPermission(
   userKey: PublicKey,
   permissionIndex: number,
   assignedRoleIndices: number[], // all roles the user has (for recompute)
+  directPermissions: Uint8Array,  // user's current direct_permissions bitmask
   authority: PublicKey
 ): Promise<string> {
   const [orgPda] = findOrgPda(orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
 
-  // Unique chunks for all assigned roles (program needs them to recompute)
-  const uniqueChunkIndices = new Set(assignedRoleIndices.map(roleChunkIndex));
-  const remainingAccounts: AccountMeta[] = [];
-  for (const ci of uniqueChunkIndices) {
-    const [pda] = findRoleChunkPda(orgPda, ci);
-    remainingAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
+  // Compute remaining direct perm indices after clearing the revoked bit,
+  // then build perm chunk accounts for filtering (Issue #2 fix — first in remaining_accounts).
+  const afterClear = directPermissions.slice();
+  const byteIdx = Math.floor(permissionIndex / 8);
+  if (byteIdx < afterClear.length) afterClear[byteIdx] &= ~(1 << (permissionIndex % 8));
+  const uniquePermChunkIndices = new Set(
+    bitmaskToIndices(afterClear).map(permChunkIndex)
+  );
+  const permChunkAccounts: AccountMeta[] = [];
+  for (const ci of uniquePermChunkIndices) {
+    const [pda] = findPermChunkPda(orgPda, ci);
+    permChunkAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
   }
 
+  // Role chunks for all assigned roles (after perm chunks)
+  const uniqueRoleChunkIndices = new Set(assignedRoleIndices.map(roleChunkIndex));
+  const roleChunkAccounts: AccountMeta[] = [];
+  for (const ci of uniqueRoleChunkIndices) {
+    const [pda] = findRoleChunkPda(orgPda, ci);
+    roleChunkAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
+  }
+
+  const remainingAccounts: AccountMeta[] = [...permChunkAccounts, ...roleChunkAccounts];
+
   return (program.methods as any)
-    .revokeUserPermission(permissionIndex)
+    .revokeUserPermission(permissionIndex, permChunkAccounts.length)
     .accounts({
       userAccount: userAccountPda,
       userPermCache: userPermCachePda,
