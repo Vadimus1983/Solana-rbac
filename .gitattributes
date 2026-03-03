@@ -1,0 +1,6 @@
+# Tell GitHub Linguist to ignore non-Rust directories
+# so Rust shows as the primary language of this repo
+
+admin/*     linguist-vendored
+tests/*     linguist-documentation
+cli/*       linguist-vendored
