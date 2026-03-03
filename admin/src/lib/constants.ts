@@ -13,4 +13,4 @@ export const RPC_ENDPOINT =
 export const CLUSTER: string =
   import.meta.env.VITE_CLUSTER ?? "localnet";
 
-export const APP_VERSION = "1.0.0";
+export const APP_VERSION = "1.0.2";

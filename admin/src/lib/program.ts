@@ -443,21 +443,36 @@ export async function fetchAllUserAccounts(
 /**
  * Call processRecomputeBatch for a single user.
  * Requires Recomputing state.
+ *
+ * Perm chunks are collected from BOTH the user's direct_permissions AND every
+ * assigned role's effective_permissions. The on-chain handler then filters each
+ * bit through the PermChunk active flag, so deleted permissions are always
+ * stripped regardless of whether roles were recomputed in this cycle.
  */
 export async function txProcessRecomputeUser(
   program: Program,
   orgName: string,
   user: UserAccountData,
+  allRoles: RoleEntry[],
   authority: PublicKey
 ): Promise<string> {
   const [orgPda] = findOrgPda(orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, user.user);
   const [userPermCachePda] = findUserPermCachePda(orgPda, user.user);
 
-  // Perm chunks for filtering inactive direct_permissions (first in remaining_accounts).
-  const uniquePermChunkIndices = new Set(
-    bitmaskToIndices(user.directPermissions).map(permChunkIndex)
-  );
+  // Collect every permission index that may appear in this user's result:
+  // their own direct_permissions + each assigned role's effective_permissions.
+  // The union of perm chunk indices covers everything the on-chain filter will touch.
+  const allPermIndices = new Set<number>();
+  bitmaskToIndices(user.directPermissions).forEach((i) => allPermIndices.add(i));
+  for (const roleRef of user.assignedRoles) {
+    const role = allRoles.find((r) => r.topoIndex === roleRef.topoIndex);
+    if (role && role.active) {
+      bitmaskToIndices(role.effectivePermissions).forEach((i) => allPermIndices.add(i));
+    }
+  }
+
+  const uniquePermChunkIndices = new Set([...allPermIndices].map(permChunkIndex));
   const permChunkAccounts: AccountMeta[] = [];
   for (const ci of uniquePermChunkIndices) {
     const [pda] = findPermChunkPda(orgPda, ci);

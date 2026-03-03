@@ -156,7 +156,12 @@ export default function Users({
   };
 
   const assignedRoleIndices = userData?.assignedRoles.map((r) => r.topoIndex) ?? [];
-  const directPermIndices = userData ? bitmaskToIndices(userData.directPermissions) : [];
+  const directPermIndices = userData
+    ? bitmaskToIndices(userData.directPermissions).filter((pi) => {
+        const p = allPerms.find((p) => p.index === pi);
+        return p?.active ?? false;
+      })
+    : [];
   const effectivePermIndices = userData ? bitmaskToIndices(userData.effectivePermissions) : [];
 
   const availableRoles = allRoles.filter(

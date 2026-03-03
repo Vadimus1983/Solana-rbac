@@ -197,7 +197,7 @@ export default function Overview({
       const short = user.user.toBase58().slice(0, 6) + "…";
       setUserProgress(`User ${i + 1}/${users.length}: ${short}`);
       try {
-        await txProcessRecomputeUser(program, orgName, user, wallet.publicKey!);
+        await txProcessRecomputeUser(program, orgName, user, allRoles, wallet.publicKey!);
       } catch (e: any) {
         failed++;
         addToast({

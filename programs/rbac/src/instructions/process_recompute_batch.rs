@@ -121,7 +121,41 @@ pub fn handler(
             let chunk = find_role_chunk_in_accounts(user_chunks, &org_key, chunk_idx, ctx.program_id)?;
             let entry = &chunk.entries[slot];
             if entry.active {
-                result = bitmask_union(&result, &entry.effective_permissions);
+                // Filter the role's effective_permissions through PermChunk active status,
+                // identical to how we filter direct_permissions above. This guarantees
+                // on-chain consistency: deleted permissions are dropped regardless of
+                // whether the role itself was recomputed in this update cycle.
+                for (byte_idx, &byte) in entry.effective_permissions.iter().enumerate() {
+                    if byte == 0 {
+                        continue;
+                    }
+                    for bit in 0..8u32 {
+                        if byte & (1 << bit) != 0 {
+                            let perm_index = (byte_idx as u32) * 8 + bit;
+                            let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                            let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                            if pcc > 0 {
+                                if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
+                                    perm_accounts,
+                                    &org_key,
+                                    perm_chunk_idx,
+                                    ctx.program_id,
+                                ) {
+                                    if perm_slot < perm_chunk.entries.len()
+                                        && perm_chunk.entries[perm_slot].index == perm_index
+                                        && perm_chunk.entries[perm_slot].active
+                                    {
+                                        set_bit(&mut result, perm_index);
+                                    }
+                                    // inactive or not in entries → bit silently dropped
+                                }
+                                // chunk not in accounts → treat permission as inactive, drop bit
+                            } else {
+                                set_bit(&mut result, perm_index);
+                            }
+                        }
+                    }
+                }
             }
             new_versions.push((role_ref.topo_index, entry.version));
         }
