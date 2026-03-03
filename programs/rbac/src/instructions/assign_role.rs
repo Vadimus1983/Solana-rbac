@@ -87,6 +87,10 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32) -> Result<()> {
             RbacError::NotSuperAdmin
         );
         require!(
+            caller_cache.organization == ctx.accounts.organization.key(),
+            RbacError::NotSuperAdmin
+        );
+        require!(
             caller_cache.permissions_version >= org_permissions_version,
             RbacError::StalePermissions
         );

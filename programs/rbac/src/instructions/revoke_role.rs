@@ -78,6 +78,10 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32) -> Result<()> {
             RbacError::NotSuperAdmin
         );
         require!(
+            caller_cache.organization == org_key,
+            RbacError::NotSuperAdmin
+        );
+        require!(
             caller_cache.permissions_version >= org_permissions_version,
             RbacError::StalePermissions
         );

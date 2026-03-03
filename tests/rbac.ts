@@ -356,14 +356,16 @@ describe("rbac", () => {
   // -------------------------------------------------------------------------
   it("Step 7a: recompute viewer role", async () => {
     await program.methods
-      .recomputeRole(viewerRoleIdx)
+      .recomputeRole(viewerRoleIdx, 1)  // perm_chunk_count=1: permChunk0 filters direct perms
       .accounts({
         roleChunk: roleChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([])
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     const chunk = await program.account.roleChunk.fetch(roleChunk0Pda);
@@ -374,14 +376,16 @@ describe("rbac", () => {
 
   it("Step 7b: recompute editor role", async () => {
     await program.methods
-      .recomputeRole(editorRoleIdx)
+      .recomputeRole(editorRoleIdx, 1)  // perm_chunk_count=1: permChunk0 filters direct perms
       .accounts({
         roleChunk: roleChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([])
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     const chunk = await program.account.roleChunk.fetch(roleChunk0Pda);
@@ -406,7 +410,7 @@ describe("rbac", () => {
 
   it("Step 9: Batch recompute (users have no roles yet — 0 chunks each)", async () => {
     // Both users have no roles assigned yet, so 0 chunk accounts each.
-    // Layout: [UA, UPC] per user (no chunks).
+    // Layout: [UA, UPC] per user (no chunks). perm_chunk_count=0 (no direct perms either).
     const remainingAccounts = [
       { pubkey: bobUaPda, isWritable: true, isSigner: false },
       { pubkey: bobUpcPda, isWritable: true, isSigner: false },
@@ -415,7 +419,7 @@ describe("rbac", () => {
     ];
 
     await program.methods
-      .processRecomputeBatch(Buffer.from([0, 0]))
+      .processRecomputeBatch(Buffer.from([0, 0]), 0)
       .accounts({
         organization: orgPda,
         authority: alice.publicKey,
@@ -625,16 +629,18 @@ describe("rbac", () => {
       })
       .rpc();
 
-    // Recompute editor role (children: none)
+    // Recompute editor role (children: none). perm_chunk_count=1 → permChunk0 filters active perms.
     await program.methods
-      .recomputeRole(editorRoleIdx)
+      .recomputeRole(editorRoleIdx, 1)
       .accounts({
         roleChunk: roleChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([])
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     // Verify editor effective_permissions now includes perm 2
@@ -654,9 +660,10 @@ describe("rbac", () => {
     assert.equal(org.permissionsVersion.toNumber(), 2);
 
     // Carol has viewer role (chunk 0). Bob has no roles.
-    // Layout: [UA, UPC] for Bob (0 chunks), [UA, UPC, chunk0] for Carol (1 chunk).
+    // perm_chunk_count=0: all active perms are included as-is (no inactive perms exist here).
+    // Layout: [UA, UPC] for Bob (0 chunks), [UA, UPC, roleChunk0] for Carol (1 chunk).
     await program.methods
-      .processRecomputeBatch(Buffer.from([0, 1]))
+      .processRecomputeBatch(Buffer.from([0, 1]), 0)
       .accounts({
         organization: orgPda,
         authority: alice.publicKey,
@@ -732,6 +739,7 @@ describe("rbac", () => {
   // Step 16 — Role assignment across chunk boundary
   //           Create 16 more roles so role 16 lands in chunk 1
   // -------------------------------------------------------------------------
+  // NOTE: Step 16 processRecomputeBatch is fixed above (perm_chunk_count=0).
   it("Step 16: Role at index 16 goes into chunk 1", async () => {
     // Begin update to create roles 2..16 (filling chunk 0 then starting chunk 1)
     await program.methods
@@ -795,8 +803,9 @@ describe("rbac", () => {
         remainingAccts.push({ pubkey: upcPda, isWritable: true, isSigner: false });
         for (const c of userChunks) remainingAccts.push(c);
       }
+      // perm_chunk_count=0: no inactive perms were introduced in this cycle.
       await program.methods
-        .processRecomputeBatch(Buffer.from(counts))
+        .processRecomputeBatch(Buffer.from(counts), 0)
         .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
         .remainingAccounts(remainingAccts)
         .rpc();
@@ -810,5 +819,347 @@ describe("rbac", () => {
     const orgFinal = await program.account.organization.fetch(orgPda);
     assert.deepEqual(orgFinal.state, { idle: {} });
     assert.equal(orgFinal.roleCount, ROLES_PER_CHUNK + 1, "should have 17 roles total");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Security: Issue #1 — Cross-organization privilege escalation in delegation
+  //
+  // The delegation path in assign_role / revoke_role reads a UserPermCache from
+  // remaining_accounts[0]. Before the fix, only `user == authority` was checked —
+  // the `organization` field was never verified. This allowed an attacker holding
+  // MANAGE_ROLES in org A to call assign_role / revoke_role in org B by passing
+  // their org-A cache.
+  //
+  // Fix: require(caller_cache.organization == org_key) was added to both handlers.
+  //
+  // Tests:
+  //   1. Attack blocked (assign_role)  — cross-org cache → NotSuperAdmin
+  //   2. Attack blocked (revoke_role)  — cross-org cache → NotSuperAdmin
+  //   3. Legitimate delegation (assign_role) — correct-org cache → success
+  // ---------------------------------------------------------------------------
+
+  // MANAGE_ROLES_PERMISSION_INDEX is a well-known constant in state.rs.
+  const MANAGE_ROLES_PERM_IDX = 3;
+
+  // A fresh org that carol's attack cache belongs to.
+  const attackOrgName = "attack_org";
+  let attackOrgPda: PublicKey;
+  let carolUaAttackOrgPda: PublicKey;
+  let carolUpcAttackOrgPda: PublicKey;
+
+  // A victim user created in acme_corp for delegation tests.
+  const dave = Keypair.generate();
+  let daveUaPda: PublicKey;
+  let daveUpcPda: PublicKey;
+
+  before(async () => {
+    const sig = await provider.connection.requestAirdrop(dave.publicKey, 2 * LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig);
+  });
+
+  it("Security setup: create attack_org and carol's user account in it", async () => {
+    [attackOrgPda] = findOrgPda(program.programId, attackOrgName);
+    [carolUaAttackOrgPda] = findUserAccountPda(program.programId, attackOrgPda, carol.publicKey);
+    [carolUpcAttackOrgPda] = findUserPermCachePda(program.programId, attackOrgPda, carol.publicKey);
+
+    // Alice creates attack_org (she's the super_admin; carol will be a member).
+    await program.methods
+      .initializeOrganization(attackOrgName)
+      .accounts({
+        organization: attackOrgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Create carol's user account in attack_org so her UPC exists on-chain.
+    await program.methods
+      .createUserAccount()
+      .accounts({
+        userAccount: carolUaAttackOrgPda,
+        userPermCache: carolUpcAttackOrgPda,
+        organization: attackOrgPda,
+        user: carol.publicKey,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Give carol MANAGE_ROLES (index 3) in attack_org through a full update cycle so
+    // her attack_org cache has the permission bit set and a current version.
+    // update cycle: begin → create perms 0-3 → commit → empty batch → finish
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: attackOrgPda, authority: alice.publicKey })
+      .rpc();
+
+    const [attackPermChunk0Pda] = findPermChunkPda(program.programId, attackOrgPda, 0);
+    for (const [name, desc] of [
+      ["perm_0", "placeholder 0"],
+      ["perm_1", "placeholder 1"],
+      ["perm_2", "placeholder 2"],
+      ["manage_roles", "Allows managing role assignments"],
+    ]) {
+      await program.methods
+        .createPermission(name, desc)
+        .accounts({
+          permChunk: attackPermChunk0Pda,
+          organization: attackOrgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+    }
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: attackOrgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Empty processRecomputeBatch — no users need full recompute; carol's UA
+    // will be updated by assign_user_permission below.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([]), 0)
+      .accounts({ organization: attackOrgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: attackOrgPda, authority: alice.publicKey })
+      .rpc();
+
+    // In Idle: assign MANAGE_ROLES directly to carol in attack_org.
+    await program.methods
+      .assignUserPermission(MANAGE_ROLES_PERM_IDX)
+      .accounts({
+        userAccount: carolUaAttackOrgPda,
+        userPermCache: carolUpcAttackOrgPda,
+        organization: attackOrgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const carolAttackCache = await (program.account as any).userPermCache.fetch(carolUpcAttackOrgPda);
+    assert.ok(
+      hasBit(carolAttackCache.effectivePermissions as number[], MANAGE_ROLES_PERM_IDX),
+      "carol should have MANAGE_ROLES in attack_org cache"
+    );
+  });
+
+  it("Security setup: create dave's user account in acme_corp", async () => {
+    [daveUaPda] = findUserAccountPda(program.programId, orgPda, dave.publicKey);
+    [daveUpcPda] = findUserPermCachePda(program.programId, orgPda, dave.publicKey);
+
+    await program.methods
+      .createUserAccount()
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        organization: orgPda,
+        user: dave.publicKey,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+  });
+
+  // ── Attack test 1: assign_role ─────────────────────────────────────────────
+
+  it("Issue #1 blocked (assign_role): cross-org cache is rejected with NotSuperAdmin", async () => {
+    // carol has MANAGE_ROLES in attack_org (confirmed above).
+    // She tries to use her attack_org UPC as delegation proof for acme_corp.
+    // Without the fix this would succeed; with the fix it must fail.
+    try {
+      await program.methods
+        .assignRole(viewerRoleIdx)
+        .accounts({
+          userAccount: daveUaPda,
+          userPermCache: daveUpcPda,
+          roleChunk: roleChunk0Pda,
+          organization: orgPda,        // target: acme_corp
+          authority: carol.publicKey,  // carol signs (user check passes)
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([
+          // Attack: pass carol's cache from a different org
+          { pubkey: carolUpcAttackOrgPda, isWritable: false, isSigner: false },
+        ])
+        .signers([carol])
+        .rpc();
+      assert.fail("Expected NotSuperAdmin — cross-org cache must be rejected");
+    } catch (err: any) {
+      assert.ok(
+        err.toString().includes("NotSuperAdmin"),
+        `Expected NotSuperAdmin, got: ${err}`
+      );
+    }
+
+    // dave must still have no roles
+    const daveUa = await program.account.userAccount.fetch(daveUaPda);
+    assert.equal(daveUa.assignedRoles.length, 0, "dave should have no roles — assign was blocked");
+  });
+
+  // ── Attack test 2: revoke_role ─────────────────────────────────────────────
+
+  it("Issue #1 blocked (revoke_role): cross-org cache is rejected with NotSuperAdmin", async () => {
+    // Alice (super_admin) first assigns the viewer role to dave legitimately.
+    await program.methods
+      .assignRole(viewerRoleIdx)
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        roleChunk: roleChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    {
+      const ua = await program.account.userAccount.fetch(daveUaPda);
+      assert.ok(
+        ua.assignedRoles.some((r: any) => r.topoIndex === viewerRoleIdx),
+        "dave should have viewer role before revoke attempt"
+      );
+    }
+
+    // carol tries to revoke dave's viewer role using her attack_org cache.
+    try {
+      await program.methods
+        .revokeRole(viewerRoleIdx)
+        .accounts({
+          userAccount: daveUaPda,
+          userPermCache: daveUpcPda,
+          organization: orgPda,        // target: acme_corp
+          authority: carol.publicKey,  // carol signs
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([
+          // Attack: cross-org cache as delegation proof, then role chunks would follow
+          { pubkey: carolUpcAttackOrgPda, isWritable: false, isSigner: false },
+        ])
+        .signers([carol])
+        .rpc();
+      assert.fail("Expected NotSuperAdmin — cross-org cache must be rejected");
+    } catch (err: any) {
+      assert.ok(
+        err.toString().includes("NotSuperAdmin"),
+        `Expected NotSuperAdmin, got: ${err}`
+      );
+    }
+
+    // dave must still have the viewer role (revoke was blocked)
+    const daveUa = await program.account.userAccount.fetch(daveUaPda);
+    assert.ok(
+      daveUa.assignedRoles.some((r: any) => r.topoIndex === viewerRoleIdx),
+      "dave should still have viewer role — revoke was blocked"
+    );
+  });
+
+  // ── Positive test: legitimate delegation must still work ───────────────────
+
+  it("Issue #1 fix: legitimate delegation with correct-org cache is accepted", async () => {
+    // Give carol MANAGE_ROLES in acme_corp itself so she has a valid delegation cache.
+    // acme_corp currently has next_permission_index = 3; MANAGE_ROLES_PERM_IDX = 3.
+    // Run a minimal update cycle to create perm 3 ("manage_roles") in acme_corp.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await program.methods
+      .createPermission("manage_roles", "Allows managing role assignments")
+      .accounts({
+        permChunk: permChunk0Pda,   // perm index 3 lands in chunk 0 (indices 0-31)
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Commit (no role recompute required by on-chain rules).
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Empty user batch — we only need the org version to advance.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // In Idle: grant carol MANAGE_ROLES (index 3) directly in acme_corp.
+    await program.methods
+      .assignUserPermission(MANAGE_ROLES_PERM_IDX)
+      .accounts({
+        userAccount: carolUaPda,
+        userPermCache: carolUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const carolAcmeCache = await (program.account as any).userPermCache.fetch(carolUpcPda);
+    assert.ok(
+      hasBit(carolAcmeCache.effectivePermissions as number[], MANAGE_ROLES_PERM_IDX),
+      "carol should have MANAGE_ROLES in acme_corp cache"
+    );
+
+    // Clean up: revoke dave's viewer role so we can re-assign it via delegation.
+    await program.methods
+      .revokeRole(viewerRoleIdx)
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,   // alice as super_admin, no remaining_accounts needed
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([])  // dave has no remaining roles after viewer is revoked
+      .rpc();
+
+    // Now carol (delegated) assigns the viewer role to dave using her acme_corp cache.
+    await program.methods
+      .assignRole(viewerRoleIdx)
+      .accounts({
+        userAccount: daveUaPda,
+        userPermCache: daveUpcPda,
+        roleChunk: roleChunk0Pda,
+        organization: orgPda,        // acme_corp
+        authority: carol.publicKey,  // carol signs as delegated caller
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([
+        // Legitimate: carol's own acme_corp cache as delegation proof
+        { pubkey: carolUpcPda, isWritable: false, isSigner: false },
+      ])
+      .signers([carol])
+      .rpc();
+
+    const daveUa = await program.account.userAccount.fetch(daveUaPda);
+    assert.ok(
+      daveUa.assignedRoles.some((r: any) => r.topoIndex === viewerRoleIdx),
+      "dave should have viewer role — assigned via carol's legitimate delegation"
+    );
+
+    const daveCache = await (program.account as any).userPermCache.fetch(daveUpcPda);
+    assert.ok(
+      hasBit(daveCache.effectiveRoles as number[], viewerRoleIdx),
+      "dave's cache should have viewer role bit set"
+    );
+    assert.ok(
+      hasBit(daveCache.effectivePermissions as number[], readPermIdx),
+      "dave should have read permission from viewer role"
+    );
   });
 });
