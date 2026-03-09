@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-rbac = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+rbac = "H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf"
 
 [programs.localnet]
 rbac = "H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf"

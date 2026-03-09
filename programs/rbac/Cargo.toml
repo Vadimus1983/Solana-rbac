@@ -21,4 +21,5 @@ unexpected_cfgs = "allow"
 
 [dependencies]
 anchor-lang = { version = "0.32.0", features = ["init-if-needed"] }
+solana-security-txt = "1.1.1"
 

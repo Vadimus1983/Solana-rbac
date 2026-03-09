@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use solana_security_txt::security_txt;
 
 pub mod errors;
 pub mod macros;
@@ -8,6 +9,16 @@ pub mod state;
 use instructions::*;
 
 declare_id!("H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf");
+
+#[cfg(not(feature = "no-entrypoint"))]
+security_txt! {
+    name: "Solana RBAC",
+    project_url: "https://github.com/Vadimus1983/Solana-rbac",
+    contacts: "email:vadym.prygoda@gmail.com,link:https://github.com/Vadimus1983/Solana-rbac/issues",
+    policy: "https://github.com/Vadimus1983/Solana-rbac/blob/main/SECURITY.md",
+    preferred_languages: "en",
+    source_code: "https://github.com/Vadimus1983/Solana-rbac"
+}
 
 #[program]
 pub mod rbac {
