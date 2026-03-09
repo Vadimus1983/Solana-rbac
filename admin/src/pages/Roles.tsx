@@ -6,6 +6,7 @@ import Modal from "../components/Modal";
 import { bitmaskToIndices } from "../lib/bitmask";
 import {
   getProgram,
+  fetchTxFee,
   txCreateRole,
   txDeleteRole,
   txAddRolePermission,
@@ -68,7 +69,8 @@ export default function Roles({
     const id = addToast({ status: "pending", message: `Sending ${label}…` });
     try {
       const sig = await fn();
-      updateToast(id, { status: "success", message: `${label} confirmed`, txSig: sig });
+      const fee = await fetchTxFee(connection, sig);
+      updateToast(id, { status: "success", message: `${label} confirmed`, txSig: sig, fee });
       onRefresh();
     } catch (e: any) {
       updateToast(id, { status: "error", message: e?.message ?? `${label} failed` });

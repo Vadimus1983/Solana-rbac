@@ -48,4 +48,5 @@ export interface Toast {
   message: string;
   txSig?: string;
   cluster?: string;
+  fee?: number;
 }

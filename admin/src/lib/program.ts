@@ -34,6 +34,29 @@ function makeAnchorWallet(wallet: WalletContextState) {
 }
 
 // ---------------------------------------------------------------------------
+// Transaction fee helper
+// ---------------------------------------------------------------------------
+
+export async function fetchTxFee(
+  connection: Connection,
+  sig: string
+): Promise<number | undefined> {
+  try {
+    const tx = await connection.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!tx?.meta) return undefined;
+    // Total lamports that left the fee payer's wallet:
+    // includes signature fee + rent deposits for account creation/reallocation.
+    const spent = tx.meta.preBalances[0] - tx.meta.postBalances[0];
+    return spent > 0 ? spent : tx.meta.fee;
+  } catch {
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Program factory
 // ---------------------------------------------------------------------------
 
@@ -292,12 +315,13 @@ export async function txAddRolePermission(
   authority: PublicKey
 ): Promise<string> {
   const [orgPda] = findOrgPda(orgName);
-  const chunkIdx = roleChunkIndex(roleIndex);
-  const [roleChunkPda] = findRoleChunkPda(orgPda, chunkIdx);
+  const [roleChunkPda] = findRoleChunkPda(orgPda, roleChunkIndex(roleIndex));
+  const [permChunkPda] = findPermChunkPda(orgPda, permChunkIndex(permissionIndex));
   return (program.methods as any)
     .addRolePermission(roleIndex, permissionIndex)
     .accounts({
       roleChunk: roleChunkPda,
+      permChunk: permChunkPda,
       organization: orgPda,
       authority,
       systemProgram: SystemProgram.programId,
@@ -573,7 +597,7 @@ export async function txAssignRole(
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   const [roleChunkPda] = findRoleChunkPda(orgPda, roleChunkIndex(roleIndex));
   return (program.methods as any)
-    .assignRole(roleIndex)
+    .assignRole(roleIndex, 0)  // pcc=0: trust cached effective_perms (no filtering)
     .accounts({
       userAccount: userAccountPda,
       userPermCache: userPermCachePda,
@@ -641,11 +665,13 @@ export async function txAssignUserPermission(
   const [orgPda] = findOrgPda(orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
+  const [permChunkPda] = findPermChunkPda(orgPda, permChunkIndex(permissionIndex));
   return (program.methods as any)
     .assignUserPermission(permissionIndex)
     .accounts({
       userAccount: userAccountPda,
       userPermCache: userPermCachePda,
+      permChunk: permChunkPda,
       organization: orgPda,
       authority,
       systemProgram: SystemProgram.programId,
@@ -699,5 +725,51 @@ export async function txRevokeUserPermission(
       authority,
     })
     .remainingAccounts(remainingAccounts)
+    .rpc();
+}
+
+// ---------------------------------------------------------------------------
+// Access verification (read-only on-chain checks)
+// ---------------------------------------------------------------------------
+
+/** Calls the on-chain has_permission instruction.
+ *  Resolves normally if the user has the permission and the cache is fresh.
+ *  Throws AnchorError with code "InsufficientPermission" or "StalePermissions". */
+export async function txHasPermission(
+  program: Program,
+  orgName: string,
+  userKey: PublicKey,
+  permissionIndex: number
+): Promise<void> {
+  const [orgPda] = findOrgPda(orgName);
+  const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
+  await (program.methods as any)
+    .hasPermission(permissionIndex)
+    .accounts({
+      organization: orgPda,
+      user: userKey,
+      userPermCache: userPermCachePda,
+    })
+    .rpc();
+}
+
+/** Calls the on-chain has_role instruction.
+ *  Resolves normally if the user has the role and the cache is fresh.
+ *  Throws AnchorError with code "RoleNotAssigned" or "StalePermissions". */
+export async function txHasRole(
+  program: Program,
+  orgName: string,
+  userKey: PublicKey,
+  roleIndex: number
+): Promise<void> {
+  const [orgPda] = findOrgPda(orgName);
+  const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
+  await (program.methods as any)
+    .hasRole(roleIndex)
+    .accounts({
+      organization: orgPda,
+      user: userKey,
+      userPermCache: userPermCachePda,
+    })
     .rpc();
 }

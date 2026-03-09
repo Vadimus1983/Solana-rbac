@@ -7,12 +7,15 @@ import { bitmaskToIndices } from "../lib/bitmask";
 import { findOrgPda } from "../lib/pda";
 import {
   getProgram,
+  fetchTxFee,
   fetchUserAccount,
   txCreateUserAccount,
   txAssignRole,
   txRevokeRole,
   txAssignUserPermission,
   txRevokeUserPermission,
+  txHasPermission,
+  txHasRole,
 } from "../lib/program";
 
 interface Props {
@@ -44,6 +47,14 @@ export default function Users({
   const [assignRoleIdx, setAssignRoleIdx] = useState<number | "">("");
   const [assignPermIdx, setAssignPermIdx] = useState<number | "">("");
 
+  // Check Access state
+  type CheckResult = "ok" | "denied" | "stale" | "error";
+  const [checkRoleIdx, setCheckRoleIdx] = useState<number | "">("");
+  const [checkPermIdx, setCheckPermIdx] = useState<number | "">("");
+  const [checkRoleResult, setCheckRoleResult] = useState<CheckResult | null>(null);
+  const [checkPermResult, setCheckPermResult] = useState<CheckResult | null>(null);
+  const [checking, setChecking] = useState(false);
+
   const isIdle = orgData.state === "idle";
   const isSuperAdmin =
     wallet.publicKey?.toBase58() === orgData.superAdmin.toBase58();
@@ -56,7 +67,8 @@ export default function Users({
       const id = addToast({ status: "pending", message: `Sending ${label}…` });
       try {
         const sig = await fn();
-        updateToast(id, { status: "success", message: `${label} confirmed`, txSig: sig });
+        const fee = await fetchTxFee(connection, sig);
+        updateToast(id, { status: "success", message: `${label} confirmed`, txSig: sig, fee });
         return true;
       } catch (e: any) {
         updateToast(id, { status: "error", message: e?.message ?? `${label} failed` });
@@ -65,7 +77,7 @@ export default function Users({
         setBusy(false);
       }
     },
-    [addToast, updateToast]
+    [addToast, updateToast, connection]
   );
 
   const loadUser = useCallback(async (key: string) => {
@@ -155,7 +167,45 @@ export default function Users({
     if (ok) await refreshUser();
   };
 
-  const assignedRoleIndices = userData?.assignedRoles.map((r) => r.topoIndex) ?? [];
+  const handleCheckRole = async () => {
+    if (!userData || checkRoleIdx === "" || !wallet.publicKey) return;
+    setChecking(true);
+    setCheckRoleResult(null);
+    try {
+      const program = getProgram(connection, wallet);
+      await txHasRole(program, orgName, userData.user, checkRoleIdx as number);
+      setCheckRoleResult("ok");
+    } catch (e: any) {
+      const code: string = e?.error?.errorCode?.code ?? "";
+      if (code === "StalePermissions") setCheckRoleResult("stale");
+      else if (code === "RoleNotAssigned" || code === "InvalidRoleIndex") setCheckRoleResult("denied");
+      else setCheckRoleResult("error");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleCheckPerm = async () => {
+    if (!userData || checkPermIdx === "" || !wallet.publicKey) return;
+    setChecking(true);
+    setCheckPermResult(null);
+    try {
+      const program = getProgram(connection, wallet);
+      await txHasPermission(program, orgName, userData.user, checkPermIdx as number);
+      setCheckPermResult("ok");
+    } catch (e: any) {
+      const code: string = e?.error?.errorCode?.code ?? "";
+      if (code === "StalePermissions") setCheckPermResult("stale");
+      else if (code === "InsufficientPermission" || code === "InvalidPermissionIndex") setCheckPermResult("denied");
+      else setCheckPermResult("error");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const assignedRoleIndices = userData?.assignedRoles
+    .filter((r) => allRoles.find((ro) => ro.topoIndex === r.topoIndex)?.active ?? false)
+    .map((r) => r.topoIndex) ?? [];
   const directPermIndices = userData
     ? bitmaskToIndices(userData.directPermissions).filter((pi) => {
         const p = allPerms.find((p) => p.index === pi);
@@ -256,31 +306,37 @@ export default function Users({
           {/* Assigned Roles */}
           <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
             <h3 className="font-semibold text-gray-900 mb-3">Assigned Roles</h3>
-            {assignedRoleIndices.length === 0 ? (
-              <p className="text-sm text-gray-400 mb-3">No roles assigned.</p>
-            ) : (
-              <div className="flex flex-wrap gap-2 mb-3">
-                {userData.assignedRoles.map((r) => {
-                  const role = allRoles.find((ro) => ro.topoIndex === r.topoIndex);
-                  return (
-                    <span
-                      key={r.topoIndex}
-                      className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-50 border border-indigo-200 rounded-full text-sm text-indigo-700"
-                    >
-                      <span>#{r.topoIndex} {role?.name ?? "unknown"}</span>
-                      <button
-                        onClick={() => handleRevokeRole(r.topoIndex)}
-                        disabled={!canWrite || busy}
-                        title={!isIdle ? notIdleMsg : !isSuperAdmin ? "Only super_admin" : "Revoke role"}
-                        className="text-indigo-300 hover:text-red-500 disabled:opacity-40 font-bold leading-none"
+            {(() => {
+              const activeAssigned = userData.assignedRoles.filter((r) => {
+                const role = allRoles.find((ro) => ro.topoIndex === r.topoIndex);
+                return role?.active ?? false;
+              });
+              return activeAssigned.length === 0 ? (
+                <p className="text-sm text-gray-400 mb-3">No roles assigned.</p>
+              ) : (
+                <div className="flex flex-wrap gap-2 mb-3">
+                  {activeAssigned.map((r) => {
+                    const role = allRoles.find((ro) => ro.topoIndex === r.topoIndex);
+                    return (
+                      <span
+                        key={r.topoIndex}
+                        className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-50 border border-indigo-200 rounded-full text-sm text-indigo-700"
                       >
-                        ×
-                      </button>
-                    </span>
-                  );
-                })}
-              </div>
-            )}
+                        <span>#{r.topoIndex} {role?.name ?? "unknown"}</span>
+                        <button
+                          onClick={() => handleRevokeRole(r.topoIndex)}
+                          disabled={!canWrite || busy}
+                          title={!isIdle ? notIdleMsg : !isSuperAdmin ? "Only super_admin" : "Revoke role"}
+                          className="text-indigo-300 hover:text-red-500 disabled:opacity-40 font-bold leading-none"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    );
+                  })}
+                </div>
+              );
+            })()}
             <div className="flex gap-2">
               <select
                 className="flex-1 border border-gray-300 rounded px-2 py-1.5 text-sm disabled:opacity-50"
@@ -362,6 +418,111 @@ export default function Users({
               </button>
             </div>
           </div>
+
+          {/* Check Access */}
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+            <h3 className="font-semibold text-gray-900 mb-4">Check Access</h3>
+            <div className="space-y-4">
+
+              {/* Check Role */}
+              <div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Role</p>
+                <div className="flex gap-2 items-center">
+                  <select
+                    className="flex-1 border border-gray-300 rounded px-2 py-1.5 text-sm disabled:opacity-50"
+                    value={checkRoleIdx}
+                    onChange={(e) => {
+                      setCheckRoleIdx(e.target.value === "" ? "" : Number(e.target.value));
+                      setCheckRoleResult(null);
+                    }}
+                    disabled={checking || !wallet.connected}
+                  >
+                    <option value="">— select role —</option>
+                    {allRoles.filter((r) => r.active).map((r) => (
+                      <option key={r.topoIndex} value={r.topoIndex}>
+                        #{r.topoIndex}: {r.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={handleCheckRole}
+                    disabled={checkRoleIdx === "" || checking || !wallet.connected}
+                    className="px-4 py-1.5 text-sm bg-gray-700 text-white rounded hover:bg-gray-800 disabled:opacity-50 transition-colors whitespace-nowrap"
+                  >
+                    {checking ? "Checking…" : "Check"}
+                  </button>
+                  {checkRoleResult === "ok" && (
+                    <span className="flex items-center gap-1 text-green-600 text-sm font-medium whitespace-nowrap">
+                      <span className="text-base">✓</span> Has role
+                    </span>
+                  )}
+                  {checkRoleResult === "denied" && (
+                    <span className="flex items-center gap-1 text-red-600 text-sm font-medium whitespace-nowrap">
+                      <span className="text-base">✗</span> No role
+                    </span>
+                  )}
+                  {checkRoleResult === "stale" && (
+                    <span className="flex items-center gap-1 text-amber-600 text-sm font-medium whitespace-nowrap">
+                      ⚠ Stale cache
+                    </span>
+                  )}
+                  {checkRoleResult === "error" && (
+                    <span className="text-red-500 text-sm whitespace-nowrap">Check failed</span>
+                  )}
+                </div>
+              </div>
+
+              {/* Check Permission */}
+              <div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Permission</p>
+                <div className="flex gap-2 items-center">
+                  <select
+                    className="flex-1 border border-gray-300 rounded px-2 py-1.5 text-sm disabled:opacity-50"
+                    value={checkPermIdx}
+                    onChange={(e) => {
+                      setCheckPermIdx(e.target.value === "" ? "" : Number(e.target.value));
+                      setCheckPermResult(null);
+                    }}
+                    disabled={checking || !wallet.connected}
+                  >
+                    <option value="">— select permission —</option>
+                    {allPerms.filter((p) => p.active).map((p) => (
+                      <option key={p.index} value={p.index}>
+                        #{p.index}: {p.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={handleCheckPerm}
+                    disabled={checkPermIdx === "" || checking || !wallet.connected}
+                    className="px-4 py-1.5 text-sm bg-gray-700 text-white rounded hover:bg-gray-800 disabled:opacity-50 transition-colors whitespace-nowrap"
+                  >
+                    {checking ? "Checking…" : "Check"}
+                  </button>
+                  {checkPermResult === "ok" && (
+                    <span className="flex items-center gap-1 text-green-600 text-sm font-medium whitespace-nowrap">
+                      <span className="text-base">✓</span> Has permission
+                    </span>
+                  )}
+                  {checkPermResult === "denied" && (
+                    <span className="flex items-center gap-1 text-red-600 text-sm font-medium whitespace-nowrap">
+                      <span className="text-base">✗</span> No permission
+                    </span>
+                  )}
+                  {checkPermResult === "stale" && (
+                    <span className="flex items-center gap-1 text-amber-600 text-sm font-medium whitespace-nowrap">
+                      ⚠ Stale cache
+                    </span>
+                  )}
+                  {checkPermResult === "error" && (
+                    <span className="text-red-500 text-sm whitespace-nowrap">Check failed</span>
+                  )}
+                </div>
+              </div>
+
+            </div>
+          </div>
+
         </div>
       )}
     </div>

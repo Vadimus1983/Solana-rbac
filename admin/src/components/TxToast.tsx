@@ -34,6 +34,11 @@ export default function TxToast({ toast, cluster }: Props) {
       <span className="mt-0.5 font-bold">{icon}</span>
       <div className="flex flex-col gap-1">
         <span>{toast.message}</span>
+        {toast.status === "success" && toast.fee !== undefined && (
+          <span className="text-gray-500 text-xs">
+            Cost: {toast.fee.toLocaleString()} lamports
+          </span>
+        )}
         {toast.status === "success" && toast.txSig && (
           <a
             href={explorerUrl(toast.txSig, cluster)}
