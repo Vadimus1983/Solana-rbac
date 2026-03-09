@@ -19,6 +19,7 @@ pub struct DeleteRole<'info> {
     pub role_chunk: Account<'info, RoleChunk>,
 
     #[account(
+        mut,
         seeds = [b"organization", organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
@@ -47,6 +48,11 @@ pub fn handler(ctx: Context<DeleteRole>, role_index: u32) -> Result<()> {
     entry.effective_permissions.clear();
     entry.children.clear();
     entry.version += 1;
+
+    // Issue #8: keep active_role_count in sync so begin_update can seed
+    // roles_pending_recompute with the correct number of live roles.
+    ctx.accounts.organization.active_role_count =
+        ctx.accounts.organization.active_role_count.saturating_sub(1);
 
     emit!(RoleDeleted {
         organization: ctx.accounts.organization.key(),

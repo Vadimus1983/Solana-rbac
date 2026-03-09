@@ -73,4 +73,12 @@ pub enum RbacError {
 
     #[msg("Required chunk account not found in remaining_accounts")]
     ChunkNotFound,
+
+    /// Issue #3 / #6 — permission is soft-deleted and must not be assigned.
+    #[msg("Permission is inactive (soft-deleted) and cannot be assigned or added to a role")]
+    PermissionInactive,
+
+    /// Issue #8 — all roles must be recomputed before commit_update, all users before finish_update.
+    #[msg("Update incomplete: not all roles/users have been recomputed yet")]
+    UpdateIncomplete,
 }

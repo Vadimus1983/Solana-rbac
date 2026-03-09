@@ -18,6 +18,19 @@ pub struct AddRolePermission<'info> {
     )]
     pub role_chunk: Account<'info, RoleChunk>,
 
+    /// The chunk containing the permission. Read-only; used to verify the
+    /// permission is still active (Issue #6 fix).
+    #[account(
+        seeds = [
+            b"perm_chunk",
+            organization.key().as_ref(),
+            &(permission_index / PERMS_PER_CHUNK as u32).to_le_bytes(),
+        ],
+        bump = perm_chunk.bump,
+        constraint = perm_chunk.organization == organization.key(),
+    )]
+    pub perm_chunk: Account<'info, PermChunk>,
+
     #[account(
         seeds = [b"organization", organization.name.as_bytes()],
         bump = organization.bump,
@@ -39,6 +52,20 @@ pub fn handler(
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Updating, RbacError::OrgNotInUpdateMode);
     require!(permission_index < org.next_permission_index, RbacError::InvalidPermissionIndex);
+
+    // Issue #6: reject soft-deleted permissions — recompute_role would drop them
+    // anyway, but this gives an immediate, clear error at the call site.
+    let perm_slot = permission_index as usize % PERMS_PER_CHUNK;
+    let perm_chunk = &ctx.accounts.perm_chunk;
+    require!(perm_slot < perm_chunk.entries.len(), RbacError::PermSlotEmpty);
+    require!(
+        perm_chunk.entries[perm_slot].index == permission_index,
+        RbacError::PermSlotEmpty
+    );
+    require!(
+        perm_chunk.entries[perm_slot].active,
+        RbacError::PermissionInactive
+    );
 
     let slot = role_index as usize % ROLES_PER_CHUNK;
     {

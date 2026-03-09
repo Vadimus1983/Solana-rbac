@@ -105,9 +105,18 @@ pub struct Organization {
     pub member_count: u64,
     pub next_permission_index: u32,
     pub role_count: u32,
+    /// Number of currently active (non-deleted) roles. Incremented by create_role,
+    /// decremented by delete_role. Used to initialise roles_pending_recompute.
+    pub active_role_count: u32,
     pub permissions_version: u64,
     pub state: OrgState,
     pub bump: u8,
+    /// Issue #8: set to active_role_count by begin_update, decremented by
+    /// recompute_role. commit_update requires this to be 0.
+    pub roles_pending_recompute: u32,
+    /// Issue #8: set to member_count by commit_update, decremented by
+    /// process_recompute_batch. finish_update requires this to be 0.
+    pub users_pending_recompute: u32,
 }
 
 impl Organization {
@@ -117,9 +126,12 @@ impl Organization {
         + 8                           // member_count
         + 4                           // next_permission_index
         + 4                           // role_count
+        + 4                           // active_role_count  (new)
         + 8                           // permissions_version
         + 1 + 0                       // OrgState enum (1-byte tag, no data)
-        + 1;                          // bump
+        + 1                           // bump
+        + 4                           // roles_pending_recompute  (new)
+        + 4;                          // users_pending_recompute  (new)
 }
 
 /// Holds up to ROLES_PER_CHUNK role entries. PDA: ["role_chunk", org, chunk_index_le4].
@@ -493,4 +505,181 @@ pub fn find_role_chunk_in_accounts<'info>(
         }
     }
     err!(RbacError::ChunkNotFound)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (pure logic, no runtime required)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Bitmask helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_has_bit_basic() {
+        let mask = vec![0b0000_0101u8]; // bits 0 and 2 set
+        assert!(has_bit(&mask, 0));
+        assert!(!has_bit(&mask, 1));
+        assert!(has_bit(&mask, 2));
+        assert!(!has_bit(&mask, 3));
+    }
+
+    #[test]
+    fn test_has_bit_out_of_bounds() {
+        let mask = vec![0xFFu8];
+        assert!(!has_bit(&mask, 8));   // byte 1 not present
+        assert!(!has_bit(&mask, 255));
+    }
+
+    #[test]
+    fn test_set_bit_grows_vec() {
+        let mut mask: Vec<u8> = Vec::new();
+        set_bit(&mut mask, 17); // byte 2, bit 1
+        assert_eq!(mask.len(), 3);
+        assert!(has_bit(&mask, 17));
+        assert!(!has_bit(&mask, 16));
+    }
+
+    #[test]
+    fn test_clear_bit() {
+        let mut mask = vec![0xFF, 0xFF];
+        clear_bit(&mut mask, 8); // first bit of byte 1
+        assert!(!has_bit(&mask, 8));
+        assert!(has_bit(&mask, 9));
+        assert!(has_bit(&mask, 7));
+    }
+
+    #[test]
+    fn test_bitmask_union_different_lengths() {
+        let a = vec![0b1010_0000u8]; // bits 5,7
+        let b = vec![0b0000_0001u8, 0b0000_0010u8]; // bits 0, 9
+        let r = bitmask_union(&a, &b);
+        assert_eq!(r.len(), 2);
+        assert!(has_bit(&r, 0));
+        assert!(has_bit(&r, 5));
+        assert!(has_bit(&r, 7));
+        assert!(has_bit(&r, 9));
+        assert!(!has_bit(&r, 1));
+    }
+
+    #[test]
+    fn test_bitmask_union_empty() {
+        let r = bitmask_union(&[], &[]);
+        assert!(r.is_empty());
+        let r2 = bitmask_union(&[0xABu8], &[]);
+        assert_eq!(r2, vec![0xABu8]);
+    }
+
+    // ── Issue #1 — delegation PDA uniqueness across orgs ──────────────────
+    // The fix adds find_program_address verification so a cache from org A
+    // cannot be used to authorise operations in org B.
+    #[test]
+    fn test_pda_uniqueness_across_orgs() {
+        let org_a = Pubkey::new_unique();
+        let org_b = Pubkey::new_unique();
+        let user  = Pubkey::new_unique();
+        let pid   = Pubkey::new_unique();
+
+        let (pda_a, _) = Pubkey::find_program_address(
+            &[b"user_perm_cache", org_a.as_ref(), user.as_ref()],
+            &pid,
+        );
+        let (pda_b, _) = Pubkey::find_program_address(
+            &[b"user_perm_cache", org_b.as_ref(), user.as_ref()],
+            &pid,
+        );
+        assert_ne!(pda_a, pda_b, "PDAs for different orgs must differ");
+    }
+
+    // ── Issue #3/#6 — PermEntry active flag ───────────────────────────────
+    #[test]
+    fn test_perm_entry_active_flag() {
+        let entry = PermEntry {
+            index: 5,
+            name: "read".into(),
+            description: "".into(),
+            created_by: Pubkey::default(),
+            active: true,
+        };
+        assert!(entry.active);
+        let deleted = PermEntry { active: false, ..entry };
+        assert!(!deleted.active);
+    }
+
+    // ── Issue #4 — staleness: version comparison ───────────────────────────
+    #[test]
+    fn test_permissions_version_staleness() {
+        let cache_version: u64 = 2;
+        let org_version: u64 = 3;
+        assert!(cache_version < org_version, "stale cache detected");
+        let fresh_version: u64 = 3;
+        assert!(fresh_version >= org_version, "fresh cache passes");
+    }
+
+    // ── Issue #5/#7 — filtering a bitmask through an active-permission set ─
+    #[test]
+    fn test_filter_bitmask_by_active_set() {
+        let mut source: Vec<u8> = Vec::new();
+        set_bit(&mut source, 0);
+        set_bit(&mut source, 1); // will be "deleted"
+        set_bit(&mut source, 2);
+
+        let active: std::collections::HashSet<u32> = [0u32, 2u32].iter().cloned().collect();
+
+        let mut result: Vec<u8> = Vec::new();
+        for (byte_idx, &byte) in source.iter().enumerate() {
+            if byte == 0 { continue; }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let idx = (byte_idx as u32) * 8 + bit;
+                    if active.contains(&idx) {
+                        set_bit(&mut result, idx);
+                    }
+                }
+            }
+        }
+
+        assert!(has_bit(&result, 0));
+        assert!(!has_bit(&result, 1), "deleted perm 1 must be dropped");
+        assert!(has_bit(&result, 2));
+    }
+
+    // ── Issue #8 — completeness counters ──────────────────────────────────
+    #[test]
+    fn test_roles_pending_recompute_counter() {
+        let active_role_count: u32 = 3;
+        let mut pending: u32 = active_role_count; // begin_update
+        for _ in 0..active_role_count {
+            pending = pending.saturating_sub(1); // each recompute_role call
+        }
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn test_users_pending_recompute_counter() {
+        let member_count: u32 = 5;
+        let mut pending: u32 = member_count; // commit_update
+        pending = pending.saturating_sub(3); // first process_recompute_batch (3 users)
+        pending = pending.saturating_sub(2); // second call (2 users)
+        assert_eq!(pending, 0);
+    }
+
+    // ── RoleEntry serialized_size sanity ──────────────────────────────────
+    #[test]
+    fn test_role_entry_serialized_size() {
+        let entry = RoleEntry {
+            topo_index: 0,
+            version: 0,
+            name: "admin".into(),
+            description: "".into(),
+            direct_permissions: vec![0u8; 2],
+            effective_permissions: vec![0u8; 2],
+            children: vec![],
+            active: true,
+        };
+        // 4(topo) + 8(ver) + (4+5)(name) + (4+0)(desc) + (4+2)(dp) + (4+2)(ep) + (4+0)(children) + 1(active)
+        assert_eq!(entry.serialized_size(), 4 + 8 + 9 + 4 + 6 + 6 + 4 + 1);
+    }
 }

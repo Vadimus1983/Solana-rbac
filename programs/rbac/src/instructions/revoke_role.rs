@@ -74,6 +74,17 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         let cache_info = &ctx.remaining_accounts[0];
         require!(cache_info.owner == ctx.program_id, RbacError::NotSuperAdmin);
 
+        // Issue #1: verify PDA derivation to prevent cross-org privilege escalation.
+        let (expected_pda, _) = Pubkey::find_program_address(
+            &[
+                b"user_perm_cache",
+                org_key.as_ref(),
+                ctx.accounts.authority.key().as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require!(cache_info.key() == expected_pda, RbacError::NotSuperAdmin);
+
         let cache_data = cache_info
             .try_borrow_data()
             .map_err(|_| error!(RbacError::NotSuperAdmin))?;

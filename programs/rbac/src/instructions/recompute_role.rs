@@ -30,6 +30,7 @@ pub struct RecomputeRole<'info> {
     pub role_chunk: Account<'info, RoleChunk>,
 
     #[account(
+        mut,
         seeds = [b"organization", organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
@@ -98,18 +99,24 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         }
     }
 
-    // Union each child's effective_permissions into result.
+    // Union each child's effective_permissions into result, filtered through
+    // PermChunks (Issue #7: prevents stale/deleted permission bits inherited
+    // from children that have not yet been recomputed in this update cycle).
     for &child_topo in &children {
         let child_chunk_idx = child_topo / ROLES_PER_CHUNK as u32;
         let child_slot = child_topo as usize % ROLES_PER_CHUNK;
 
-        if child_chunk_idx == parent_chunk_idx {
+        let child_eff: Vec<u8> = if child_chunk_idx == parent_chunk_idx {
             let chunk = &ctx.accounts.role_chunk;
             if child_slot < chunk.entries.len() {
-                let child_entry = &chunk.entries[child_slot];
-                if child_entry.active && child_entry.topo_index == child_topo {
-                    result = bitmask_union(&result, &child_entry.effective_permissions);
+                let ce = &chunk.entries[child_slot];
+                if ce.active && ce.topo_index == child_topo {
+                    ce.effective_permissions.clone()
+                } else {
+                    Vec::new()
                 }
+            } else {
+                Vec::new()
             }
         } else {
             let child_chunk = find_role_chunk_in_accounts(
@@ -119,9 +126,41 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
                 ctx.program_id,
             )?;
             if child_slot < child_chunk.entries.len() {
-                let child_entry = &child_chunk.entries[child_slot];
-                if child_entry.active && child_entry.topo_index == child_topo {
-                    result = bitmask_union(&result, &child_entry.effective_permissions);
+                let ce = &child_chunk.entries[child_slot];
+                if ce.active && ce.topo_index == child_topo {
+                    ce.effective_permissions.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Filter child_eff through PermChunks before merging — same approach
+        // as for direct_permissions above.
+        for (byte_idx, &byte) in child_eff.iter().enumerate() {
+            if byte == 0 { continue; }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let perm_index = (byte_idx as u32) * 8 + bit;
+                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                    if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
+                        perm_accounts,
+                        &org_key,
+                        perm_chunk_idx,
+                        ctx.program_id,
+                    ) {
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut result, perm_index);
+                        }
+                        // inactive or not found → bit dropped
+                    }
+                    // chunk not supplied → treat as inactive
                 }
             }
         }
@@ -157,6 +196,11 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     entry.effective_permissions = result;
     entry.version += 1;
 
-    msg!("Role index {} effective_permissions recomputed", role_index);
+    // Issue #8: decrement the recompute counter so commit_update can enforce
+    // that all active roles were processed before closing the update cycle.
+    let org = &mut ctx.accounts.organization;
+    org.roles_pending_recompute = org.roles_pending_recompute.saturating_sub(1);
+
+    msg!("Role index {} effective_permissions recomputed ({} roles remaining)", role_index, org.roles_pending_recompute);
     Ok(())
 }

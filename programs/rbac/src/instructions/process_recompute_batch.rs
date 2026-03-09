@@ -17,6 +17,7 @@ use crate::state::*;
 #[derive(Accounts)]
 pub struct ProcessRecomputeBatch<'info> {
     #[account(
+        mut,
         seeds = [b"organization", organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
@@ -37,11 +38,13 @@ pub fn handler(
     user_chunk_counts: Vec<u8>,
     perm_chunk_count: u8,
 ) -> Result<()> {
-    let org = &ctx.accounts.organization;
-    require!(org.state == OrgState::Recomputing, RbacError::OrgNotRecomputing);
+    {
+        let org = &ctx.accounts.organization;
+        require!(org.state == OrgState::Recomputing, RbacError::OrgNotRecomputing);
+    }
 
-    let target_version = org.permissions_version;
-    let org_key = org.key();
+    let target_version = ctx.accounts.organization.permissions_version;
+    let org_key = ctx.accounts.organization.key();
 
     let pcc = perm_chunk_count as usize;
     let perm_accounts = &ctx.remaining_accounts[..pcc];
@@ -212,5 +215,12 @@ pub fn handler(
     }
 
     require!(offset == remaining.len(), RbacError::AccountCountMismatch);
+
+    // Issue #8: decrement the user recompute counter by the number of users
+    // processed in this batch so finish_update can enforce completeness.
+    let users_processed = user_chunk_counts.len() as u32;
+    let org = &mut ctx.accounts.organization;
+    org.users_pending_recompute = org.users_pending_recompute.saturating_sub(users_processed);
+
     Ok(())
 }

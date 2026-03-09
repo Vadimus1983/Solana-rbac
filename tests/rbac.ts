@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
+import { Program, AnchorError } from "@coral-xyz/anchor";
 import { Rbac } from "../target/types/rbac";
 import { assert } from "chai";
 import {
@@ -312,6 +312,7 @@ describe("rbac", () => {
       .addRolePermission(viewerRoleIdx, readPermIdx)
       .accounts({
         roleChunk: roleChunk0Pda,
+        permChunk: permChunk0Pda,  // active check: verify permission is not soft-deleted
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -329,6 +330,7 @@ describe("rbac", () => {
       .addRolePermission(editorRoleIdx, readPermIdx)
       .accounts({
         roleChunk: roleChunk0Pda,
+        permChunk: permChunk0Pda,  // active check: verify permission is not soft-deleted
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -339,6 +341,7 @@ describe("rbac", () => {
       .addRolePermission(editorRoleIdx, writePermIdx)
       .accounts({
         roleChunk: roleChunk0Pda,
+        permChunk: permChunk0Pda,  // active check: verify permission is not soft-deleted
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -455,7 +458,7 @@ describe("rbac", () => {
   // -------------------------------------------------------------------------
   it("Step 11a: Alice assigns Bob the editor role (Idle state)", async () => {
     await program.methods
-      .assignRole(editorRoleIdx)
+      .assignRole(editorRoleIdx, 0)  // perm_chunk_count=0: trust cached effective_perms
       .accounts({
         userAccount: bobUaPda,
         userPermCache: bobUpcPda,
@@ -487,7 +490,7 @@ describe("rbac", () => {
 
   it("Step 11b: Alice assigns Carol the viewer role (Idle state)", async () => {
     await program.methods
-      .assignRole(viewerRoleIdx)
+      .assignRole(viewerRoleIdx, 0)  // perm_chunk_count=0: trust cached effective_perms
       .accounts({
         userAccount: carolUaPda,
         userPermCache: carolUpcPda,
@@ -624,6 +627,7 @@ describe("rbac", () => {
       .addRolePermission(editorRoleIdx, adminPermIdx)
       .accounts({
         roleChunk: roleChunk0Pda,
+        permChunk: permChunk0Pda,  // active check: verify permission is not soft-deleted
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -686,8 +690,9 @@ describe("rbac", () => {
       .rpc();
 
     // Assign editor role back to Bob (in Idle — inline recompute)
+    // pcc=1 filters role's effective_permissions through permChunk0 (drops inactive bits).
     await program.methods
-      .assignRole(editorRoleIdx)
+      .assignRole(editorRoleIdx, 1)
       .accounts({
         userAccount: bobUaPda,
         userPermCache: bobUpcPda,
@@ -696,6 +701,9 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     const bobUa = await program.account.userAccount.fetch(bobUaPda);
@@ -823,7 +831,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Security: Issue #1 — Cross-organization privilege escalation in delegation
+  // Security: Cross-organization privilege escalation in delegation
   //
   // The delegation path in assign_role / revoke_role reads a UserPermCache from
   // remaining_accounts[0]. Before the fix, only `user == authority` was checked —
@@ -917,12 +925,14 @@ describe("rbac", () => {
       .accounts({ organization: attackOrgPda, authority: alice.publicKey })
       .rpc();
 
-    // Empty processRecomputeBatch — no users need full recompute; carol's UA
-    // will be updated by assign_user_permission below.
+    // Process all members (carol, no roles → 0 chunks) so users_pending_recompute reaches 0.
     await program.methods
-      .processRecomputeBatch(Buffer.from([]), 0)
+      .processRecomputeBatch(Buffer.from([0]), 0)
       .accounts({ organization: attackOrgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
-      .remainingAccounts([])
+      .remainingAccounts([
+        { pubkey: carolUaAttackOrgPda,  isWritable: true, isSigner: false },
+        { pubkey: carolUpcAttackOrgPda, isWritable: true, isSigner: false },
+      ])
       .rpc();
 
     await program.methods
@@ -931,11 +941,13 @@ describe("rbac", () => {
       .rpc();
 
     // In Idle: assign MANAGE_ROLES directly to carol in attack_org.
+    // Pass permChunk so the handler can verify the permission is active.
     await program.methods
       .assignUserPermission(MANAGE_ROLES_PERM_IDX)
       .accounts({
         userAccount: carolUaAttackOrgPda,
         userPermCache: carolUpcAttackOrgPda,
+        permChunk: attackPermChunk0Pda,
         organization: attackOrgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -968,13 +980,13 @@ describe("rbac", () => {
 
   // ── Attack test 1: assign_role ─────────────────────────────────────────────
 
-  it("Issue #1 blocked (assign_role): cross-org cache is rejected with NotSuperAdmin", async () => {
+  it("cross-org assign_role: supplying a cache from a different org is rejected with NotSuperAdmin", async () => {
     // carol has MANAGE_ROLES in attack_org (confirmed above).
     // She tries to use her attack_org UPC as delegation proof for acme_corp.
     // Without the fix this would succeed; with the fix it must fail.
     try {
       await program.methods
-        .assignRole(viewerRoleIdx)
+        .assignRole(viewerRoleIdx, 0)  // pcc=0 for this attack attempt
         .accounts({
           userAccount: daveUaPda,
           userPermCache: daveUpcPda,
@@ -1004,10 +1016,10 @@ describe("rbac", () => {
 
   // ── Attack test 2: revoke_role ─────────────────────────────────────────────
 
-  it("Issue #1 blocked (revoke_role): cross-org cache is rejected with NotSuperAdmin", async () => {
+  it("cross-org revoke_role: supplying a cache from a different org is rejected with NotSuperAdmin", async () => {
     // Alice (super_admin) first assigns the viewer role to dave legitimately.
     await program.methods
-      .assignRole(viewerRoleIdx)
+      .assignRole(viewerRoleIdx, 0)  // pcc=0: trust cached effective_perms
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1061,7 +1073,7 @@ describe("rbac", () => {
 
   // ── Positive test: legitimate delegation must still work ───────────────────
 
-  it("Issue #1 fix: legitimate delegation with correct-org cache is accepted", async () => {
+  it("delegation with correct-org cache is accepted", async () => {
     // Give carol MANAGE_ROLES in acme_corp itself so she has a valid delegation cache.
     // acme_corp currently has next_permission_index = 3; MANAGE_ROLES_PERM_IDX = 3.
     // Run a minimal update cycle to create perm 3 ("manage_roles") in acme_corp.
@@ -1086,11 +1098,22 @@ describe("rbac", () => {
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
 
-    // Empty user batch — we only need the org version to advance.
+    // Process ALL members (Bob=editor/chunk0, Carol=viewer/chunk0, Dave=viewer/chunk0).
+    // pcc=0: no permissions were deleted this cycle so no filtering needed.
     await program.methods
-      .processRecomputeBatch(Buffer.from([]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
-      .remainingAccounts([])
+      .remainingAccounts([
+        { pubkey: bobUaPda,       isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,      isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     await program.methods
@@ -1099,11 +1122,13 @@ describe("rbac", () => {
       .rpc();
 
     // In Idle: grant carol MANAGE_ROLES (index 3) directly in acme_corp.
+    // Pass permChunk so the handler verifies the permission is active.
     await program.methods
       .assignUserPermission(MANAGE_ROLES_PERM_IDX)
       .accounts({
         userAccount: carolUaPda,
         userPermCache: carolUpcPda,
+        permChunk: permChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -1132,7 +1157,7 @@ describe("rbac", () => {
 
     // Now carol (delegated) assigns the viewer role to dave using her acme_corp cache.
     await program.methods
-      .assignRole(viewerRoleIdx)
+      .assignRole(viewerRoleIdx, 0)  // pcc=0: trust cached effective_perms
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1166,8 +1191,8 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Security: Issue #2 — revoke_role / revoke_user_permission resurrect
-  //           soft-deleted permissions from stale direct_permissions bits
+  // Security: revoke_role / revoke_user_permission resurrect soft-deleted
+  //           permissions from stale direct_permissions bits
   //
   // Before the fix, both handlers started the recompute from
   // `ua.direct_permissions.clone()` directly. After a permission is
@@ -1188,9 +1213,9 @@ describe("rbac", () => {
   //   B. revokeUserPermission:  stale bit 4 is NOT resurrected
   // ---------------------------------------------------------------------------
 
-  let tempPermIdx: number; // will be 4 (nextPermissionIndex after issue #1 tests)
+  let tempPermIdx: number; // will be 4 (nextPermissionIndex after delegation tests)
 
-  it("Issue #2 setup: create temp_perm, assign to dave, soft-delete it", async () => {
+  it("stale-bit setup: create temp_perm, assign to dave, soft-delete it", async () => {
     // Phase 1: create temp_perm (next index in acme_corp after the issue #1 cycle).
     await program.methods
       .beginUpdate()
@@ -1198,7 +1223,7 @@ describe("rbac", () => {
       .rpc();
 
     await program.methods
-      .createPermission("temp_perm", "Temporary permission for Issue #2 test")
+      .createPermission("temp_perm", "Temporary permission for stale-bit test")
       .accounts({
         permChunk: permChunk0Pda,
         organization: orgPda,
@@ -1212,12 +1237,22 @@ describe("rbac", () => {
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
 
-    // Empty batch: no user's effective_permissions are affected by a newly
-    // created permission that nobody holds yet.
+    // Process all 3 members (Bob, Carol, Dave) — pcc=0, no filtering needed.
+    // Each has 1 role chunk (roleChunk0). users_pending_recompute must reach 0.
     await program.methods
-      .processRecomputeBatch(Buffer.from([]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
-      .remainingAccounts([])
+      .remainingAccounts([
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     await program.methods
@@ -1234,6 +1269,7 @@ describe("rbac", () => {
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
+        permChunk: permChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -1272,16 +1308,22 @@ describe("rbac", () => {
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
 
-    // Process dave: perm_chunk_count=1 so the handler filters his stale
-    // direct_permissions bit through permChunk0 and drops the inactive bit.
-    // dave has 1 role (viewer → chunk 0) → user_chunk_counts=[1].
+    // Process all 3 members (Bob, Carol, Dave): perm_chunk_count=1 so the handler
+    // filters stale direct_permissions bits through permChunk0.
+    // Each user has 1 role chunk (roleChunk0). users_pending_recompute must reach 0.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1]), 1)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
         { pubkey: permChunk0Pda,  isWritable: false, isSigner: false }, // perm chunk (pcc=1)
-        { pubkey: daveUaPda,      isWritable: true,  isSigner: false }, // dave UA
-        { pubkey: daveUpcPda,     isWritable: true,  isSigner: false }, // dave UPC
+        { pubkey: bobUaPda,       isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,      isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,     isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false }, // viewer in chunk 0
       ])
       .rpc();
@@ -1308,7 +1350,7 @@ describe("rbac", () => {
     );
   });
 
-  it("Issue #2 fix (revoke_role): stale direct_permissions bit is NOT resurrected", async () => {
+  it("revokeRole with perm_chunk_count>0 does not resurrect stale direct_permissions bits", async () => {
     // dave has: viewer role (0), stale bit tempPermIdx in direct_permissions.
     // Revoke the viewer role, supplying permChunk0 so the handler can filter
     // the stale bit. dave has no remaining roles → no role chunks needed.
@@ -1332,10 +1374,10 @@ describe("rbac", () => {
     // Viewer role should be gone.
     assert.equal(ua.assignedRoles.length, 0, "dave should have no roles after revokeRole");
 
-    // Issue #2: stale bit must NOT appear in effective_permissions.
+    // Stale bit must NOT appear in effective_permissions.
     assert.ok(
       !hasBit(ua.effectivePermissions as number[], tempPermIdx),
-      "Issue #2 (revoke_role): stale direct_permissions bit must NOT be resurrected in effective_permissions"
+      "stale direct_permissions bit must NOT be resurrected in effective_permissions after revokeRole"
     );
 
     // Read perm (came from viewer role) should also be gone.
@@ -1356,7 +1398,7 @@ describe("rbac", () => {
     );
   });
 
-  it("Issue #2 fix (revoke_user_permission): stale direct_permissions bit is NOT resurrected", async () => {
+  it("revokeUserPermission with perm_chunk_count>0 does not resurrect stale direct_permissions bits", async () => {
     // Setup: re-assign viewer role to dave and give him an active direct perm (read/0).
     // After this, dave has:
     //   assignedRoles:      [viewer (0)]
@@ -1364,7 +1406,7 @@ describe("rbac", () => {
     //   effectivePermissions: bit readPermIdx (viewer already provides it)
 
     await program.methods
-      .assignRole(viewerRoleIdx)
+      .assignRole(viewerRoleIdx, 0)
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1380,6 +1422,7 @@ describe("rbac", () => {
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
+        permChunk: permChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -1410,10 +1453,10 @@ describe("rbac", () => {
 
     const ua = await program.account.userAccount.fetch(daveUaPda);
 
-    // Issue #2: stale bit must NOT appear in effective_permissions.
+    // Stale bit must NOT appear in effective_permissions.
     assert.ok(
       !hasBit(ua.effectivePermissions as number[], tempPermIdx),
-      "Issue #2 (revoke_user_permission): stale direct_permissions bit must NOT be resurrected in effective_permissions"
+      "stale direct_permissions bit must NOT be resurrected in effective_permissions after revokeUserPermission"
     );
 
     // Read perm should still be in effective_permissions — it comes from the
@@ -1445,5 +1488,180 @@ describe("rbac", () => {
       hasBit(cache.effectivePermissions as number[], readPermIdx),
       "cache: read perm should be present (from viewer role)"
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Helper: process all three acme_corp members (Bob/Carol/Dave, each in chunk 0)
+  // and finish the update cycle. Used by the issue-fix integration tests below.
+  // ---------------------------------------------------------------------------
+  async function completeRecomputeCycle(pcc: number = 0): Promise<void> {
+    const extraAccounts: anchor.web3.AccountMeta[] = [];
+    if (pcc > 0) {
+      extraAccounts.push({ pubkey: permChunk0Pda, isWritable: false, isSigner: false });
+    }
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), pcc)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        ...extraAccounts,
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Integration test: assignUserPermission must reject soft-deleted permissions.
+  // ---------------------------------------------------------------------------
+  it("assignUserPermission with deleted permission is rejected with PermissionInactive", async () => {
+    // tempPermIdx (4) was soft-deleted in the stale-bit setup test.
+    // Trying to assign it directly must fail regardless of the caller's authority.
+    try {
+      await program.methods
+        .assignUserPermission(tempPermIdx)
+        .accounts({
+          userAccount: daveUaPda,
+          userPermCache: daveUpcPda,
+          permChunk: permChunk0Pda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      assert.fail("expected PermissionInactive");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "PermissionInactive");
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Integration test: add_role_permission must reject soft-deleted permissions.
+  // ---------------------------------------------------------------------------
+  it("add_role_permission with deleted permission is rejected with PermissionInactive", async () => {
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    try {
+      await program.methods
+        .addRolePermission(viewerRoleIdx, tempPermIdx)
+        .accounts({
+          roleChunk: roleChunk0Pda,
+          permChunk: permChunk0Pda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      assert.fail("expected PermissionInactive");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "PermissionInactive");
+    }
+
+    // No structural change occurred — complete the cycle with no-op filtering.
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+    await completeRecomputeCycle(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Integration test: finishUpdate must reject when users_pending_recompute > 0.
+  // ---------------------------------------------------------------------------
+  it("finishUpdate before all users are processed is rejected with UpdateIncomplete", async () => {
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Org is now Recomputing with users_pending_recompute = 3 (Bob, Carol, Dave).
+    // Calling finishUpdate immediately must be rejected.
+    try {
+      await program.methods
+        .finishUpdate()
+        .accounts({ organization: orgPda, authority: alice.publicKey })
+        .rpc();
+      assert.fail("expected UpdateIncomplete");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "UpdateIncomplete");
+    }
+
+    // Process all users and finish cleanly.
+    await completeRecomputeCycle(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Integration test: has_permission and has_role must reject stale caches.
+  // A cache is stale when its permissions_version < org.permissions_version.
+  // ---------------------------------------------------------------------------
+  it("has_permission and has_role reject stale user cache with StalePermissions", async () => {
+    // Bump permissions_version by committing a no-op update cycle.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Dave's cache now lags behind org.permissions_version by 1.
+    // Both verification instructions must reject with StalePermissions.
+    try {
+      await program.methods
+        .hasPermission(readPermIdx)
+        .accounts({ organization: orgPda, user: dave.publicKey, userPermCache: daveUpcPda })
+        .rpc();
+      assert.fail("expected StalePermissions");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "StalePermissions");
+    }
+
+    try {
+      await program.methods
+        .hasRole(viewerRoleIdx)
+        .accounts({ organization: orgPda, user: dave.publicKey, userPermCache: daveUpcPda })
+        .rpc();
+      assert.fail("expected StalePermissions");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "StalePermissions");
+    }
+
+    // Bring all caches up to date, then verify both instructions succeed.
+    await completeRecomputeCycle(0);
+
+    await program.methods
+      .hasPermission(readPermIdx)
+      .accounts({ organization: orgPda, user: dave.publicKey, userPermCache: daveUpcPda })
+      .rpc();
+
+    await program.methods
+      .hasRole(viewerRoleIdx)
+      .accounts({ organization: orgPda, user: dave.publicKey, userPermCache: daveUpcPda })
+      .rpc();
   });
 });

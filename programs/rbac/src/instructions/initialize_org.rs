@@ -30,9 +30,12 @@ pub fn handler(ctx: Context<InitializeOrganization>, name: String) -> Result<()>
     org.member_count = 0;
     org.next_permission_index = 0;
     org.role_count = 0;
+    org.active_role_count = 0;
     org.permissions_version = 0;
     org.state = OrgState::Idle;
     org.bump = ctx.bumps.organization;
+    org.roles_pending_recompute = 0;
+    org.users_pending_recompute = 0;
 
     emit!(OrgCreated {
         organization: org.key(),

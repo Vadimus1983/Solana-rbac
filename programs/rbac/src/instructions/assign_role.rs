@@ -5,13 +5,18 @@ use crate::state::*;
 
 /// Assign a role to a user. Works in **Idle** state — no batch recompute needed.
 ///
-/// The role's current `effective_permissions` are unioned into the user's
+/// The role's current `effective_permissions` are filtered through the supplied
+/// PermChunk accounts (Issue #5 fix) and then unioned into the user's
 /// `effective_permissions` inline. `cached_version` is refreshed immediately.
 /// The `UserPermCache` is also updated in the same transaction.
 ///
-/// Authorization: super_admin OR a delegated caller whose UserPermCache
-/// (remaining_accounts[0]) has MANAGE_ROLES_PERMISSION_INDEX set and a fresh
-/// `permissions_version`.
+/// Authorization: super_admin OR a delegated caller whose UserPermCache PDA
+/// (verified via find_program_address — Issue #1 fix) has
+/// MANAGE_ROLES_PERMISSION_INDEX set and a fresh `permissions_version`.
+///
+/// remaining_accounts layout:
+///   super_admin path: [perm_chunks (0..perm_chunk_count)]
+///   delegated path:   [caller_cache, perm_chunks (1..1+perm_chunk_count)]
 #[derive(Accounts)]
 #[instruction(role_index: u32)]
 pub struct AssignRole<'info> {
@@ -63,18 +68,32 @@ pub struct AssignRole<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<AssignRole>, role_index: u32) -> Result<()> {
+pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
 
+    let org_key = org.key();
     let org_permissions_version = org.permissions_version;
 
     // Authorization: super_admin OR delegated caller with MANAGE_ROLES_PERMISSION_INDEX.
+    let base_offset: usize;
     if ctx.accounts.authority.key() != org.super_admin {
         require!(!ctx.remaining_accounts.is_empty(), RbacError::NotSuperAdmin);
 
         let cache_info = &ctx.remaining_accounts[0];
         require!(cache_info.owner == ctx.program_id, RbacError::NotSuperAdmin);
+
+        // Issue #1: verify the PDA derivation to prevent a caller from
+        // supplying a UserPermCache from a different organization.
+        let (expected_pda, _) = Pubkey::find_program_address(
+            &[
+                b"user_perm_cache",
+                org_key.as_ref(),
+                ctx.accounts.authority.key().as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require!(cache_info.key() == expected_pda, RbacError::NotSuperAdmin);
 
         let cache_data = cache_info
             .try_borrow_data()
@@ -87,7 +106,7 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32) -> Result<()> {
             RbacError::NotSuperAdmin
         );
         require!(
-            caller_cache.organization == ctx.accounts.organization.key(),
+            caller_cache.organization == org_key,
             RbacError::NotSuperAdmin
         );
         require!(
@@ -98,7 +117,13 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32) -> Result<()> {
             has_bit(&caller_cache.effective_permissions, MANAGE_ROLES_PERMISSION_INDEX),
             RbacError::InsufficientPermission
         );
+        base_offset = 1;
+    } else {
+        base_offset = 0;
     }
+
+    let pcc = perm_chunk_count as usize;
+    let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
 
     // Read role entry data (clone to avoid borrow conflicts with user_account).
     let slot = role_index as usize % ROLES_PER_CHUNK;
@@ -108,7 +133,41 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32) -> Result<()> {
     require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
     require!(entry.active, RbacError::RoleInactive);
     let entry_version = entry.version;
-    let entry_effective = entry.effective_permissions.clone();
+    let raw_effective = entry.effective_permissions.clone();
+
+    // Issue #5: filter the role's effective_permissions through PermChunks
+    // to drop any bits left over from soft-deleted permissions that were not
+    // yet cleaned up by a recompute_role call in the current update cycle.
+    let entry_effective: Vec<u8> = if pcc > 0 {
+        let mut filtered = Vec::new();
+        for (byte_idx, &byte) in raw_effective.iter().enumerate() {
+            if byte == 0 { continue; }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let perm_index = (byte_idx as u32) * 8 + bit;
+                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                    if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
+                        perm_accounts,
+                        &org_key,
+                        perm_chunk_idx,
+                        ctx.program_id,
+                    ) {
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut filtered, perm_index);
+                        }
+                    }
+                }
+            }
+        }
+        filtered
+    } else {
+        // pcc == 0: no PermChunks supplied — include raw bits (backward-compatible).
+        raw_effective
+    };
 
     let ua = &mut ctx.accounts.user_account;
     require!(

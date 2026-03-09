@@ -47,6 +47,7 @@ pub fn handler(ctx: Context<CreateRole>, name: String, description: String) -> R
     require!(slot < ROLES_PER_CHUNK, RbacError::ChunkFull);
 
     org.role_count = topo_index.checked_add(1).unwrap();
+    org.active_role_count = org.active_role_count.checked_add(1).unwrap();
 
     let new_entry = RoleEntry {
         topo_index,

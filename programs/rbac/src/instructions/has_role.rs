@@ -33,6 +33,14 @@ pub fn handler(ctx: Context<HasRole>, role_index: u32) -> Result<()> {
     let cache = &ctx.accounts.user_perm_cache;
 
     require!(role_index < 256, RbacError::InvalidRoleIndex);
+
+    // Issue #4: reject stale caches — a deleted role would still appear in
+    // effective_roles until process_recompute_batch updates the cache.
+    require!(
+        cache.permissions_version >= ctx.accounts.organization.permissions_version,
+        RbacError::StalePermissions
+    );
+
     require!(
         has_bit(&cache.effective_roles, role_index),
         RbacError::RoleNotAssigned

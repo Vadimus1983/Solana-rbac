@@ -106,8 +106,8 @@ pub mod rbac {
         instructions::create_user_account::handler(ctx)
     }
 
-    pub fn assign_role(ctx: Context<AssignRole>, role_index: u32) -> Result<()> {
-        instructions::assign_role::handler(ctx, role_index)
+    pub fn assign_role(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
+        instructions::assign_role::handler(ctx, role_index, perm_chunk_count)
     }
 
     pub fn revoke_role(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {
