@@ -59,6 +59,12 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         let entry = &chunk.entries[slot];
         require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
         require!(entry.active, RbacError::RoleInactive);
+        // Idempotency guard: prevent double-decrementing roles_pending_recompute
+        // by re-running recompute_role on the same role in one update cycle.
+        require!(
+            entry.recompute_epoch != ctx.accounts.organization.permissions_version,
+            RbacError::AlreadyRecomputed
+        );
     }
 
     let children: Vec<u32> = ctx.accounts.role_chunk.entries[slot].children.clone();
@@ -100,8 +106,8 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     }
 
     // Union each child's effective_permissions into result, filtered through
-    // PermChunks (Issue #7: prevents stale/deleted permission bits inherited
-    // from children that have not yet been recomputed in this update cycle).
+    // PermChunks to prevent stale/deleted permission bits inherited from
+    // children that have not yet been recomputed in this update cycle.
     for &child_topo in &children {
         let child_chunk_idx = child_topo / ROLES_PER_CHUNK as u32;
         let child_slot = child_topo as usize % ROLES_PER_CHUNK;
@@ -166,7 +172,7 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         }
     }
 
-    // Grow the chunk if effective_permissions needs more bytes.
+    // Grow or shrink the chunk based on new vs old effective_permissions length.
     let old_eff_len = ctx.accounts.role_chunk.entries[slot].effective_permissions.len();
     let new_eff_len = result.len();
     if new_eff_len > old_eff_len {
@@ -190,14 +196,32 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
             )?;
         }
         ctx.accounts.role_chunk.to_account_info().resize(new_space)?;
+    } else if new_eff_len < old_eff_len {
+        // Reclaim account space when effective_permissions shrinks (e.g. after
+        // a permission deletion cycle) and return excess lamports to the
+        // authority so rent is not locked unnecessarily.
+        let shrinkage = old_eff_len - new_eff_len;
+        let current_len = ctx.accounts.role_chunk.to_account_info().data_len();
+        let new_space = current_len - shrinkage;
+        ctx.accounts.role_chunk.to_account_info().resize(new_space)?;
+        let rent = Rent::get()?;
+        let new_min = rent.minimum_balance(new_space);
+        let current_lamports = ctx.accounts.role_chunk.to_account_info().lamports();
+        if current_lamports > new_min {
+            let excess = current_lamports - new_min;
+            **ctx.accounts.role_chunk.to_account_info().try_borrow_mut_lamports()? -= excess;
+            **ctx.accounts.authority.to_account_info().try_borrow_mut_lamports()? += excess;
+        }
     }
 
+    let org_permissions_version = ctx.accounts.organization.permissions_version;
     let entry = &mut ctx.accounts.role_chunk.entries[slot];
     entry.effective_permissions = result;
     entry.version += 1;
+    entry.recompute_epoch = org_permissions_version;
 
-    // Issue #8: decrement the recompute counter so commit_update can enforce
-    // that all active roles were processed before closing the update cycle.
+    // Decrement the recompute counter so commit_update can enforce that all
+    // active roles were processed before closing the update cycle.
     let org = &mut ctx.accounts.organization;
     org.roles_pending_recompute = org.roles_pending_recompute.saturating_sub(1);
 

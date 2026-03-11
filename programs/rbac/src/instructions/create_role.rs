@@ -42,12 +42,20 @@ pub fn handler(ctx: Context<CreateRole>, name: String, description: String) -> R
     let topo_index = org.role_count;
     let chunk_idx = topo_index / ROLES_PER_CHUNK as u32;
 
-    // Ensure this chunk is not overfull (should never happen if clients follow protocol).
-    let slot = topo_index as usize % ROLES_PER_CHUNK;
-    require!(slot < ROLES_PER_CHUNK, RbacError::ChunkFull);
+    // UserPermCache.effective_roles is a fixed [u8; 32] (256-bit bitmask).
+    // set_bit_arr is a silent no-op for index >= 256, so cap here.
+    require!(org.active_role_count < 256, RbacError::RoleCountOverflow);
 
-    org.role_count = topo_index.checked_add(1).unwrap();
-    org.active_role_count = org.active_role_count.checked_add(1).unwrap();
+    org.role_count = topo_index
+        .checked_add(1)
+        .ok_or(error!(RbacError::RoleCountOverflow))?;
+    org.active_role_count = org
+        .active_role_count
+        .checked_add(1)
+        .ok_or(error!(RbacError::RoleCountOverflow))?;
+    // New roles created during an active update cycle must also be recomputed
+    // before commit_update, so claim one more pending slot.
+    org.roles_pending_recompute = org.roles_pending_recompute.saturating_add(1);
 
     let new_entry = RoleEntry {
         topo_index,
@@ -58,6 +66,7 @@ pub fn handler(ctx: Context<CreateRole>, name: String, description: String) -> R
         effective_permissions: Vec::new(),
         children: Vec::new(),
         active: true,
+        recompute_epoch: u64::MAX,
     };
     let entry_size = new_entry.serialized_size();
 

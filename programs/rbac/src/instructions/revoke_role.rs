@@ -54,7 +54,7 @@ pub struct RevokeRole<'info> {
 
 /// `perm_chunk_count` — number of PermChunk accounts at the START of the
 /// caller-controlled portion of `remaining_accounts`, used to filter inactive
-/// bits from `direct_permissions` (Issue #2 fix).
+/// bits from `direct_permissions`.
 ///
 /// remaining_accounts layout:
 ///   super_admin path: [perm_chunks (0..pcc), role_chunks (pcc..)]
@@ -74,7 +74,7 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         let cache_info = &ctx.remaining_accounts[0];
         require!(cache_info.owner == ctx.program_id, RbacError::NotSuperAdmin);
 
-        // Issue #1: verify PDA derivation to prevent cross-org privilege escalation.
+        // Verify PDA derivation to prevent cross-org privilege escalation.
         let (expected_pda, _) = Pubkey::find_program_address(
             &[
                 b"user_perm_cache",
@@ -123,9 +123,9 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
     require!(pos.is_some(), RbacError::RoleNotAssigned);
     ua.assigned_roles.swap_remove(pos.unwrap());
 
-    // Full recompute: filter direct_permissions through PermChunks (Issue #2 fix —
-    // stale bits from soft-deleted permissions are dropped), then union each
-    // remaining role's effective_permissions.
+    // Full recompute: filter direct_permissions through PermChunks (stale bits
+    // from soft-deleted permissions are dropped), then union each remaining
+    // role's effective_permissions.
     let mut result: Vec<u8> = Vec::new();
     for (byte_idx, &byte) in ua.direct_permissions.iter().enumerate() {
         if byte == 0 { continue; }
@@ -159,6 +159,9 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
     }
 
     // Collect new versions while computing role union.
+    // Filter each role's effective_permissions through PermChunks (same as
+    // process_recompute_batch) so deleted permission bits don't leak back in
+    // when roles haven't been recomputed since the last permission deletion.
     let mut new_versions: Vec<(u32, u64)> = Vec::with_capacity(ua.assigned_roles.len());
     for role_ref in ua.assigned_roles.iter() {
         let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;
@@ -166,7 +169,35 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         let chunk = find_role_chunk_in_accounts(role_chunks, &org_key, chunk_idx, ctx.program_id)?;
         let entry = &chunk.entries[slot];
         if entry.active {
-            result = bitmask_union(&result, &entry.effective_permissions);
+            for (byte_idx, &byte) in entry.effective_permissions.iter().enumerate() {
+                if byte == 0 { continue; }
+                for bit in 0..8u32 {
+                    if byte & (1 << bit) != 0 {
+                        let perm_index = (byte_idx as u32) * 8 + bit;
+                        if pcc > 0 {
+                            let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
+                            let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                            if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
+                                perm_accounts,
+                                &org_key,
+                                perm_chunk_idx,
+                                ctx.program_id,
+                            ) {
+                                if perm_slot < perm_chunk.entries.len()
+                                    && perm_chunk.entries[perm_slot].index == perm_index
+                                    && perm_chunk.entries[perm_slot].active
+                                {
+                                    set_bit(&mut result, perm_index);
+                                }
+                                // inactive or not in entries → bit silently dropped
+                            }
+                            // chunk not in accounts → treat permission as inactive, drop bit
+                        } else {
+                            set_bit(&mut result, perm_index);
+                        }
+                    }
+                }
+            }
         }
         new_versions.push((role_ref.topo_index, entry.version));
     }
@@ -180,6 +211,22 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
 
     ua.effective_permissions = result;
     ua.cached_version = org_permissions_version;
+
+    // Resize the UserAccount to reclaim rent released by removing a RoleRef
+    // (12 bytes) and the potentially shorter recomputed effective_permissions.
+    {
+        let new_space = ua.current_size();
+        let ua_info = ua.to_account_info();
+        ua_info.resize(new_space)?;
+        let rent = Rent::get()?;
+        let new_min = rent.minimum_balance(new_space);
+        let current_lamports = ua_info.lamports();
+        if current_lamports > new_min {
+            let excess = current_lamports - new_min;
+            **ua_info.try_borrow_mut_lamports()? -= excess;
+            **ctx.accounts.authority.to_account_info().try_borrow_mut_lamports()? += excess;
+        }
+    }
 
     // Sync UserPermCache.
     let new_effective = ua.effective_permissions.clone();

@@ -37,12 +37,14 @@ pub fn handler(ctx: Context<CreatePermission>, name: String, description: String
     require!(name.len() <= MAX_PERMISSION_NAME_LEN, RbacError::PermissionNameTooLong);
     require!(description.len() <= MAX_PERMISSION_DESC_LEN, RbacError::PermissionDescTooLong);
 
+    require!(org.next_permission_index < 256, RbacError::InvalidPermissionIndex);
+
     let perm_index = org.next_permission_index;
     let chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
-    let slot = perm_index as usize % PERMS_PER_CHUNK;
-    require!(slot < PERMS_PER_CHUNK, RbacError::ChunkFull);
 
-    org.next_permission_index = perm_index.checked_add(1).unwrap();
+    org.next_permission_index = perm_index
+        .checked_add(1)
+        .ok_or(error!(RbacError::InvalidPermissionIndex))?;
 
     let new_entry = PermEntry {
         index: perm_index,

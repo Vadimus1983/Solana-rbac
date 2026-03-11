@@ -6,13 +6,13 @@ use crate::state::*;
 /// Assign a role to a user. Works in **Idle** state — no batch recompute needed.
 ///
 /// The role's current `effective_permissions` are filtered through the supplied
-/// PermChunk accounts (Issue #5 fix) and then unioned into the user's
-/// `effective_permissions` inline. `cached_version` is refreshed immediately.
+/// PermChunk accounts and then unioned into the user's `effective_permissions`
+/// inline. `cached_version` is refreshed immediately.
 /// The `UserPermCache` is also updated in the same transaction.
 ///
 /// Authorization: super_admin OR a delegated caller whose UserPermCache PDA
-/// (verified via find_program_address — Issue #1 fix) has
-/// MANAGE_ROLES_PERMISSION_INDEX set and a fresh `permissions_version`.
+/// (verified via find_program_address) has MANAGE_ROLES_PERMISSION_INDEX set
+/// and a fresh `permissions_version`.
 ///
 /// remaining_accounts layout:
 ///   super_admin path: [perm_chunks (0..perm_chunk_count)]
@@ -83,8 +83,8 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         let cache_info = &ctx.remaining_accounts[0];
         require!(cache_info.owner == ctx.program_id, RbacError::NotSuperAdmin);
 
-        // Issue #1: verify the PDA derivation to prevent a caller from
-        // supplying a UserPermCache from a different organization.
+        // Verify the PDA derivation to prevent a caller from supplying
+        // a UserPermCache that belongs to a different organization.
         let (expected_pda, _) = Pubkey::find_program_address(
             &[
                 b"user_perm_cache",
@@ -135,9 +135,9 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
     let entry_version = entry.version;
     let raw_effective = entry.effective_permissions.clone();
 
-    // Issue #5: filter the role's effective_permissions through PermChunks
-    // to drop any bits left over from soft-deleted permissions that were not
-    // yet cleaned up by a recompute_role call in the current update cycle.
+    // Filter the role's effective_permissions through PermChunks to drop any
+    // bits left over from soft-deleted permissions that were not yet cleaned
+    // up by a recompute_role call in the current update cycle.
     let entry_effective: Vec<u8> = if pcc > 0 {
         let mut filtered = Vec::new();
         for (byte_idx, &byte) in raw_effective.iter().enumerate() {
@@ -165,7 +165,10 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         }
         filtered
     } else {
-        // pcc == 0: no PermChunks supplied — include raw bits (backward-compatible).
+        // pcc == 0: no PermChunks supplied — trust the stored effective_permissions.
+        // Safe in Idle state: commit_update enforces roles_pending_recompute == 0
+        // before the cycle closes, so all roles are freshly recomputed and their
+        // effective_permissions can no longer contain deleted-permission bits.
         raw_effective
     };
 

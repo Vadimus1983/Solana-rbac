@@ -20,13 +20,23 @@ pub fn handler(ctx: Context<CommitUpdate>) -> Result<()> {
     let org = &mut ctx.accounts.organization;
     require!(org.state == OrgState::Updating, RbacError::OrgNotInUpdateMode);
 
-    org.permissions_version += 1;
+    // Enforce that all active roles were recomputed before closing the Updating
+    // phase — prevents stale effective_permissions from persisting into roles
+    // after the cycle completes.
+    require!(
+        org.roles_pending_recompute == 0,
+        RbacError::UpdateIncomplete
+    );
+
+    org.permissions_version = org
+        .permissions_version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
     org.state = OrgState::Recomputing;
-    // Issue #8: seed user recompute counter — finish_update enforces that
-    // every member's UserAccount is processed before returning to Idle.
-    // Role completeness (roles_pending_recompute) is tracked for monitoring
-    // but not enforced here, since only modified roles need recomputing.
-    org.users_pending_recompute = org.member_count as u32;
+    // Seed user recompute counter — finish_update enforces that every member's
+    // UserAccount is processed before returning to Idle.
+    org.users_pending_recompute = u32::try_from(org.member_count)
+        .map_err(|_| error!(RbacError::MemberCountOverflow))?;
 
     msg!(
         "Organization '{}' committed update (version {}), entering Recomputing state ({} users to process)",

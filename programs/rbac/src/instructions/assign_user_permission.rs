@@ -7,8 +7,8 @@ use crate::state::*;
 /// Sets the bit in both direct_permissions and effective_permissions inline.
 /// Also updates UserPermCache.
 ///
-/// Issue #3 fix: the PermChunk for the target permission is now a required
-/// account; the handler verifies the permission is still active before granting.
+/// The PermChunk for the target permission is a required account; the handler
+/// verifies the permission is still active before granting.
 #[derive(Accounts)]
 #[instruction(permission_index: u32)]
 pub struct AssignUserPermission<'info> {
@@ -47,7 +47,7 @@ pub struct AssignUserPermission<'info> {
     pub user_perm_cache: Account<'info, UserPermCache>,
 
     /// The chunk containing the permission. Read-only; used to verify the
-    /// permission is still active (Issue #3 fix).
+    /// permission is still active.
     #[account(
         seeds = [
             b"perm_chunk",
@@ -77,7 +77,7 @@ pub fn handler(ctx: Context<AssignUserPermission>, permission_index: u32) -> Res
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
     require!(permission_index < org.next_permission_index, RbacError::InvalidPermissionIndex);
 
-    // Issue #3: reject soft-deleted permissions to prevent resurrecting revoked access.
+    // Reject soft-deleted permissions to prevent granting already-revoked access.
     let perm_slot = permission_index as usize % PERMS_PER_CHUNK;
     let perm_chunk = &ctx.accounts.perm_chunk;
     require!(perm_slot < perm_chunk.entries.len(), RbacError::PermSlotEmpty);
@@ -92,6 +92,10 @@ pub fn handler(ctx: Context<AssignUserPermission>, permission_index: u32) -> Res
 
     let org_permissions_version = org.permissions_version;
     let ua = &mut ctx.accounts.user_account;
+
+    // Reject duplicate assignments — set_bit is a no-op for data but would
+    // still emit a spurious UserPermissionGranted event.
+    require!(!has_bit(&ua.direct_permissions, permission_index), RbacError::PermissionAlreadyAssigned);
 
     set_bit(&mut ua.direct_permissions, permission_index);
     // Adding to direct also adds to effective (effective ⊇ direct always).

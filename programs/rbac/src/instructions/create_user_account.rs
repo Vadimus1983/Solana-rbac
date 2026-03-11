@@ -55,7 +55,14 @@ pub fn handler(ctx: Context<CreateUserAccount>) -> Result<()> {
     );
 
     let org = &mut ctx.accounts.organization;
-    org.member_count = org.member_count.checked_add(1).unwrap();
+    // Guard against u32::MAX — commit_update casts member_count to u32 to seed
+    // users_pending_recompute, so exceeding that range makes commit_update
+    // permanently fail.
+    require!(
+        org.member_count < u32::MAX as u64,
+        RbacError::MemberCountOverflow
+    );
+    org.member_count += 1;
     let org_permissions_version = org.permissions_version;
     let org_key = org.key();
 

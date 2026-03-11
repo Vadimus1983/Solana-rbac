@@ -46,10 +46,19 @@ pub fn handler(
     let target_version = ctx.accounts.organization.permissions_version;
     let org_key = ctx.accounts.organization.key();
 
+    let authority_info = ctx.accounts.authority.to_account_info();
+    let system_program_info = ctx.accounts.system_program.to_account_info();
+    // Pre-clone the org AccountInfo so we can use it as a lamport relay inside
+    // the loop without mixing lifetimes from ctx.accounts and remaining_accounts.
+    let org_account_info = ctx.accounts.organization.to_account_info();
+
     let pcc = perm_chunk_count as usize;
     let perm_accounts = &ctx.remaining_accounts[..pcc];
     let remaining = &ctx.remaining_accounts[pcc..];
     let mut offset: usize = 0;
+    // Track processed user pubkeys to prevent duplicate accounts from
+    // artificially decrementing users_pending_recompute below the real count.
+    let mut processed_users: std::collections::BTreeSet<Pubkey> = std::collections::BTreeSet::new();
 
     for &chunk_count in user_chunk_counts.iter() {
         // Need at least UA + UPC.
@@ -80,6 +89,33 @@ pub fn handler(
         };
 
         require!(ua.organization == org_key, RbacError::MissingAuthProof);
+
+        // Verify UA PDA using the stored bump to prevent a spoofed account
+        // from satisfying the completeness counter without updating a real member.
+        let expected_ua_pda = Pubkey::create_program_address(
+            &[b"user_account", org_key.as_ref(), ua.user.as_ref(), &[ua.bump]],
+            ctx.program_id,
+        ).map_err(|_| error!(RbacError::MissingAuthProof))?;
+        require!(ua_info.key() == expected_ua_pda, RbacError::MissingAuthProof);
+
+        // Reject duplicate users within the same batch call — each member must
+        // be counted once. This check must precede the cached_version guard so
+        // that same-batch duplicates get AccountCountMismatch: the first
+        // iteration writes cached_version = target_version back to the account,
+        // so a second iteration for the same account would otherwise hit
+        // AlreadyRecomputed instead.
+        require!(
+            processed_users.insert(ua.user),
+            RbacError::AccountCountMismatch
+        );
+
+        // Reject users already processed in a prior batch call — prevents the
+        // same user appearing across separate calls from artificially
+        // decrementing users_pending_recompute below the real unprocessed count.
+        require!(
+            ua.cached_version < target_version,
+            RbacError::AlreadyRecomputed
+        );
 
         // Recompute: filter direct_permissions (active only) ∪ each assigned role's effective_permissions.
         let mut result: Vec<u8> = Vec::new();
@@ -117,6 +153,9 @@ pub fn handler(
         }
 
         let mut new_versions: Vec<(u32, u64)> = Vec::with_capacity(ua.assigned_roles.len());
+        // Only track roles that are currently active so effective_roles doesn't
+        // keep a bit set for soft-deleted roles after a recompute cycle.
+        let mut active_role_indices: Vec<u32> = Vec::with_capacity(ua.assigned_roles.len());
 
         for role_ref in ua.assigned_roles.iter() {
             let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;
@@ -124,6 +163,7 @@ pub fn handler(
             let chunk = find_role_chunk_in_accounts(user_chunks, &org_key, chunk_idx, ctx.program_id)?;
             let entry = &chunk.entries[slot];
             if entry.active {
+                active_role_indices.push(role_ref.topo_index);
                 // Filter the role's effective_permissions through PermChunk active status,
                 // identical to how we filter direct_permissions above. This guarantees
                 // on-chain consistency: deleted permissions are dropped regardless of
@@ -178,11 +218,35 @@ pub fn handler(
         let current_lamports = ua_info.lamports();
         if current_lamports < new_min {
             let diff = new_min - current_lamports;
-            let from = ctx.accounts.authority.to_account_info();
-            **from.try_borrow_mut_lamports()? -= diff;
+            // We cannot CPI directly from authority → ua_info because they come
+            // from different Context fields (accounts vs remaining_accounts) whose
+            // lifetimes the compiler treats as distinct in the #[program] macro
+            // dispatch. Instead we relay through the org account:
+            //   Step 1: CPI authority → org  (both in ctx.accounts, same 'info ✓)
+            //   Step 2: direct org → ua      (org is program-owned → can decrease ✓)
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    system_program_info.clone(),
+                    anchor_lang::system_program::Transfer {
+                        from: authority_info.clone(),
+                        to: org_account_info.clone(),
+                    },
+                ),
+                diff,
+            )?;
+            **org_account_info.try_borrow_mut_lamports()? -= diff;
             **ua_info.try_borrow_mut_lamports()? += diff;
         }
         ua_info.resize(new_space)?;
+        // Reclaim excess lamports when UA shrinks (e.g. after a
+        // permission-deletion cycle reduces effective_permissions length).
+        // ua is program-owned (can decrease ✓); increasing authority is always OK ✓.
+        let current_lamports_after = ua_info.lamports();
+        if current_lamports_after > new_min {
+            let excess = current_lamports_after - new_min;
+            **ua_info.try_borrow_mut_lamports()? -= excess;
+            **authority_info.try_borrow_mut_lamports()? += excess;
+        }
 
         let mut ua_data = ua_info
             .try_borrow_mut_data()
@@ -200,10 +264,20 @@ pub fn handler(
                 .map_err(|_| error!(RbacError::MissingAuthProof))?
         };
 
+        // Verify UPC PDA using the stored bump.
+        let expected_upc_pda = Pubkey::create_program_address(
+            &[b"user_perm_cache", org_key.as_ref(), ua.user.as_ref(), &[cache.bump]],
+            ctx.program_id,
+        ).map_err(|_| error!(RbacError::MissingAuthProof))?;
+        require!(upc_info.key() == expected_upc_pda, RbacError::MissingAuthProof);
+
         copy_to_fixed(&mut cache.effective_permissions, &ua.effective_permissions);
+        // Only set bits for active roles — soft-deleted roles that remain in
+        // ua.assigned_roles must not appear in effective_roles, otherwise
+        // has_role returns true for a role that has been globally deleted.
         cache.effective_roles = [0u8; 32];
-        for rr in &ua.assigned_roles {
-            set_bit_arr(&mut cache.effective_roles, rr.topo_index);
+        for topo_index in &active_role_indices {
+            set_bit_arr(&mut cache.effective_roles, *topo_index);
         }
         cache.permissions_version = target_version;
 
@@ -216,8 +290,8 @@ pub fn handler(
 
     require!(offset == remaining.len(), RbacError::AccountCountMismatch);
 
-    // Issue #8: decrement the user recompute counter by the number of users
-    // processed in this batch so finish_update can enforce completeness.
+    // Decrement the user recompute counter by the number of users processed
+    // in this batch so finish_update can enforce completeness.
     let users_processed = user_chunk_counts.len() as u32;
     let org = &mut ctx.accounts.organization;
     org.users_pending_recompute = org.users_pending_recompute.saturating_sub(users_processed);

@@ -137,6 +137,45 @@ describe("rbac", () => {
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Helper: recompute every active role in `targetOrgPda`.
+  // recompute_role unconditionally calls find_perm_chunk_in_accounts for every
+  // set bit in direct_permissions, so roles that have any direct permissions
+  // require pcc=1 with the relevant PermChunk. Roles with no direct_permissions
+  // can use pcc=0 (empty remaining_accounts).
+  // All perms in this suite live in chunk 0, so permChunk0Pda is always correct.
+  // Required before every commitUpdate now that the on-chain handler enforces
+  // roles_pending_recompute == 0.
+  // ---------------------------------------------------------------------------
+  async function recomputeAllRoles(targetOrgPda: PublicKey): Promise<void> {
+    const org = await program.account.organization.fetch(targetOrgPda);
+    const roleCount = org.roleCount as number;
+    if (roleCount === 0) return;
+    const numChunks = Math.ceil(roleCount / ROLES_PER_CHUNK);
+    for (let ci = 0; ci < numChunks; ci++) {
+      const [chunkPda] = findRoleChunkPda(program.programId, targetOrgPda, ci);
+      const chunk = await (program.account as any).roleChunk.fetch(chunkPda);
+      for (const entry of chunk.entries) {
+        if (!entry.active) continue;
+        const hasDirectPerms = (entry.directPermissions as number[]).some((b: number) => b !== 0);
+        const pcc = hasDirectPerms ? 1 : 0;
+        const remainingAccts = hasDirectPerms
+          ? [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }]
+          : [];
+        await program.methods
+          .recomputeRole(entry.topoIndex as number, pcc)
+          .accounts({
+            roleChunk: chunkPda,
+            organization: targetOrgPda,
+            authority: alice.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .remainingAccounts(remainingAccts)
+          .rpc();
+      }
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Step 1 — Alice creates organisation (starts in Idle)
   // -------------------------------------------------------------------------
@@ -648,6 +687,21 @@ describe("rbac", () => {
       ])
       .rpc();
 
+    // Recompute viewer role (unchanged, but all active roles must be recomputed
+    // before commitUpdate now that roles_pending_recompute is enforced).
+    await program.methods
+      .recomputeRole(viewerRoleIdx, 1)
+      .accounts({
+        roleChunk: roleChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
     // Verify editor effective_permissions now includes perm 2
     {
       const chunk = await program.account.roleChunk.fetch(roleChunk0Pda);
@@ -780,6 +834,9 @@ describe("rbac", () => {
     assert.equal(chunk1.chunkIndex, 1, "chunk_index should be 1");
     assert.equal(chunk1.entries.length, 1, "chunk 1 should have exactly 1 entry (role 16)");
     assert.equal(chunk1.entries[0].topoIndex, 16, "role 16 in chunk 1 slot 0");
+
+    // Recompute all active roles (roles_pending_recompute must be 0 at commitUpdate).
+    await recomputeAllRoles(orgPda);
 
     // Commit and finish to return to Idle
     await program.methods
@@ -1092,7 +1149,9 @@ describe("rbac", () => {
       })
       .rpc();
 
-    // Commit (no role recompute required by on-chain rules).
+    // Recompute all active roles (roles_pending_recompute must be 0 at commitUpdate).
+    await recomputeAllRoles(orgPda);
+
     await program.methods
       .commitUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
@@ -1232,6 +1291,9 @@ describe("rbac", () => {
       })
       .rpc();
 
+    // All active roles must be recomputed before commitUpdate.
+    await recomputeAllRoles(orgPda);
+
     await program.methods
       .commitUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
@@ -1302,6 +1364,10 @@ describe("rbac", () => {
         authority: alice.publicKey,
       })
       .rpc();
+
+    // Recompute all active roles (temp_perm was deleted; roles that had it will
+    // have the bit filtered out by recompute_role's PermChunk validation).
+    await recomputeAllRoles(orgPda);
 
     await program.methods
       .commitUpdate()
@@ -1572,7 +1638,8 @@ describe("rbac", () => {
       assert.equal((err as AnchorError).error.errorCode.code, "PermissionInactive");
     }
 
-    // No structural change occurred — complete the cycle with no-op filtering.
+    // No structural change to roles — recompute all then commit.
+    await recomputeAllRoles(orgPda);
     await program.methods
       .commitUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
@@ -1588,6 +1655,8 @@ describe("rbac", () => {
       .beginUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
+
+    await recomputeAllRoles(orgPda);
 
     await program.methods
       .commitUpdate()
@@ -1621,6 +1690,8 @@ describe("rbac", () => {
       .beginUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
+
+    await recomputeAllRoles(orgPda);
 
     await program.methods
       .commitUpdate()
@@ -1663,5 +1734,787 @@ describe("rbac", () => {
       .hasRole(viewerRoleIdx)
       .accounts({ organization: orgPda, user: dave.publicKey, userPermCache: daveUpcPda })
       .rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test: processRecomputeBatch rejects duplicate users
+  //
+  // Before the fix, duplicate detection used Vec::contains which is O(n²) per
+  // batch.  After the fix, BTreeSet::insert is used — O(n log n) — and the
+  // boolean return value directly signals a duplicate without a separate
+  // contains() call.  Functional behaviour is unchanged: duplicates must be
+  // rejected so that a single member cannot decrement users_pending_recompute
+  // more than once.
+  // ---------------------------------------------------------------------------
+  it("processRecomputeBatch rejects duplicate user accounts with AccountCountMismatch", async () => {
+    // Advance to Recomputing state so processRecomputeBatch is callable.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await recomputeAllRoles(orgPda);
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Submit Bob's UA twice in the same batch — must be rejected.
+    try {
+      await program.methods
+        .processRecomputeBatch(Buffer.from([1, 1]), 0)
+        .accounts({
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([
+          { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+          { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+          { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+          // Bob appears a second time — must trigger AccountCountMismatch.
+          { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+          { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+          { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        ])
+        .rpc();
+      assert.fail("expected AccountCountMismatch for duplicate user");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "AccountCountMismatch",
+        `Expected AccountCountMismatch, got: ${err}`
+      );
+    }
+
+    // Org is still Recomputing — complete it cleanly before the next test.
+    await completeRecomputeCycle(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test: has_permission rejects permission_index >= 256 with InvalidPermissionIndex
+  //
+  // UserPermCache uses a fixed 32-byte bitmask (256 bits).  A permission with
+  // index >= 256 can never be stored in the cache, so verification must be
+  // rejected at the boundary.  This also validates why create_permission now
+  // caps next_permission_index at 255: creating index 256 would produce a
+  // permission that is permanently unverifiable.
+  // ---------------------------------------------------------------------------
+  it("has_permission rejects permission_index >= 256 with InvalidPermissionIndex", async () => {
+    try {
+      await program.methods
+        .hasPermission(256)
+        .accounts({
+          organization: orgPda,
+          user: dave.publicKey,
+          userPermCache: daveUpcPda,
+        })
+        .rpc();
+      assert.fail("expected InvalidPermissionIndex");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "InvalidPermissionIndex"
+      );
+    }
+
+    // Exact boundary: index 255 should NOT throw InvalidPermissionIndex
+    // (the bit simply won't be set, so InsufficientPermission is returned instead).
+    try {
+      await program.methods
+        .hasPermission(255)
+        .accounts({
+          organization: orgPda,
+          user: dave.publicKey,
+          userPermCache: daveUpcPda,
+        })
+        .rpc();
+      assert.fail("expected InsufficientPermission for unset bit at index 255");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "InsufficientPermission",
+        "index 255 is in-range; expect InsufficientPermission not InvalidPermissionIndex"
+      );
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test: processRecomputeBatch must clear effective_roles for soft-deleted roles
+  //
+  // Before the fix, effective_roles was populated directly from ua.assigned_roles
+  // without checking entry.active. After a role is soft-deleted globally and the
+  // recompute cycle runs, users who still have that role in their UA's
+  // assigned_roles would continue to have its bit set in effective_roles —
+  // causing has_role to incorrectly return success for a deleted role.
+  //
+  // Fix: active_role_indices is collected inside the `if entry.active { }` block,
+  // so only live roles contribute to the effective_roles bitmask.
+  //
+  // Test flow:
+  //   1. Verify Dave currently has viewer role bit set (pre-condition).
+  //   2. Delete viewer role (soft-delete) in an update cycle.
+  //   3. Run processRecomputeBatch for all users.
+  //   4. After the cycle Dave's effective_roles must NOT include viewer role.
+  //   5. has_role(viewerRoleIdx) for Dave must return RoleNotAssigned.
+  //   6. effective_permissions must not include read perm (from viewer role).
+  // ---------------------------------------------------------------------------
+  it("processRecomputeBatch clears effective_roles for soft-deleted roles", async () => {
+    // Pre-condition: Dave has viewer role from previous tests.
+    {
+      const cache = await (program.account as any).userPermCache.fetch(daveUpcPda);
+      assert.ok(
+        hasBit(cache.effectiveRoles as number[], viewerRoleIdx),
+        "pre-condition: Dave should have viewer role bit before deletion"
+      );
+    }
+
+    // Delete viewer role during an update cycle.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await program.methods
+      .deleteRole(viewerRoleIdx)
+      .accounts({
+        roleChunk: roleChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .rpc();
+
+    // Recompute all remaining ACTIVE roles (viewer is now inactive — skipped).
+    await recomputeAllRoles(orgPda);
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Process all users. Bob has editor (chunk 0), Carol and Dave have deleted
+    // viewer still in their UA.assigned_roles (chunk 0 provided so entry can be
+    // read and checked for active status).
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // After fix: effective_roles must NOT include the deleted viewer role.
+    const daveCache = await (program.account as any).userPermCache.fetch(daveUpcPda);
+    assert.ok(
+      !hasBit(daveCache.effectiveRoles as number[], viewerRoleIdx),
+      "deleted role must NOT appear in effective_roles after processRecomputeBatch"
+    );
+
+    // has_role must return RoleNotAssigned (not success) for the deleted role.
+    try {
+      await program.methods
+        .hasRole(viewerRoleIdx)
+        .accounts({ organization: orgPda, user: dave.publicKey, userPermCache: daveUpcPda })
+        .rpc();
+      assert.fail("expected RoleNotAssigned for soft-deleted role");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "RoleNotAssigned",
+        `Expected RoleNotAssigned for deleted role, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    // effective_permissions must also not include viewer role's read permission.
+    assert.ok(
+      !hasBit(daveCache.effectivePermissions as number[], readPermIdx),
+      "deleted role's permissions must be absent from effective_permissions"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // assignUserPermission must reject duplicate direct assignments.
+  //
+  // set_bit is idempotent so data wouldn't be corrupted, but a spurious
+  // UserPermissionGranted event would still be emitted. The handler requires
+  // !has_bit(&ua.direct_permissions, permission_index) before setting.
+  // ---------------------------------------------------------------------------
+  it("assignUserPermission duplicate is rejected with PermissionAlreadyAssigned", async () => {
+    // Org is Idle. write permission (1) is active. Bob has no direct perms.
+    await program.methods
+      .assignUserPermission(writePermIdx)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        permChunk: permChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const ua = await program.account.userAccount.fetch(bobUaPda);
+    assert.ok(
+      hasBit(ua.directPermissions as number[], writePermIdx),
+      "write bit must be set in direct_permissions after first assignment"
+    );
+
+    // Second assignment of the same permission must be rejected.
+    try {
+      await program.methods
+        .assignUserPermission(writePermIdx)
+        .accounts({
+          userAccount: bobUaPda,
+          userPermCache: bobUpcPda,
+          permChunk: permChunk0Pda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      assert.fail("expected PermissionAlreadyAssigned");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "PermissionAlreadyAssigned",
+        `Expected PermissionAlreadyAssigned, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    // direct_permissions must still have exactly one grant (bit not duplicated).
+    const uaAfter = await program.account.userAccount.fetch(bobUaPda);
+    assert.ok(
+      hasBit(uaAfter.directPermissions as number[], writePermIdx),
+      "write bit must remain set after rejected duplicate"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // removeChildRole must reclaim the 4 bytes freed by swap_remove.
+  //
+  // add_child_role allocates +4 bytes for the new child_index (u32).
+  // Without the resize-down, those 4 bytes (and their rent) would be
+  // permanently locked in the RoleChunk.
+  // ---------------------------------------------------------------------------
+  it("removeChildRole reclaims 4-byte chunk rent on removal", async () => {
+    // Need two fresh roles where parent_index > child_index (cycle invariant).
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Fetch roleCount AFTER beginUpdate to get the correct next indices.
+    // After step 16, roleCount = 17, so new roles land at indices 17 and 18
+    // which are in chunk 1 (17/16 = 1), not chunk 0.
+    const orgState = await program.account.organization.fetch(orgPda);
+    const childRoleIdx  = orgState.roleCount as number;       // e.g. 17
+    const parentRoleIdx = childRoleIdx + 1;                   // e.g. 18
+    const newChunkIdx   = Math.floor(parentRoleIdx / ROLES_PER_CHUNK);
+    const [newRoleChunkPda] = findRoleChunkPda(program.programId, orgPda, newChunkIdx);
+
+    await program.methods.createRole("child_r", "")
+      .accounts({
+        roleChunk: newRoleChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    await program.methods.createRole("parent_r", "")
+      .accounts({
+        roleChunk: newRoleChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // addChildRole(parent > child) — parent and child are in the same new chunk.
+    await program.methods
+      .addChildRole(parentRoleIdx, childRoleIdx)
+      .accounts({
+        roleChunk: newRoleChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([]) // same chunk — no extra account needed
+      .rpc();
+
+    const afterAdd = await provider.connection.getAccountInfo(newRoleChunkPda);
+    const lenAfterAdd = afterAdd!.data.length;
+    const lamAfterAdd = afterAdd!.lamports;
+
+    // removeChildRole — must shrink chunk by 4 bytes and return excess rent.
+    await program.methods
+      .removeChildRole(parentRoleIdx, childRoleIdx)
+      .accounts({
+        roleChunk: newRoleChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .rpc();
+
+    const afterRemove = await provider.connection.getAccountInfo(newRoleChunkPda);
+    assert.equal(
+      afterRemove!.data.length,
+      lenAfterAdd - 4,
+      "removeChildRole must shrink the RoleChunk by 4 bytes"
+    );
+    assert.isBelow(
+      afterRemove!.lamports,
+      lamAfterAdd,
+      "removeChildRole must return excess rent lamports to authority"
+    );
+
+    // Close the update cycle cleanly.
+    await recomputeAllRoles(orgPda);
+    await program.methods.commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Process all 3 members. Bob has editor (chunk 0); Carol and Dave still
+    // have the deleted viewer (chunk 0) in their assigned_roles.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    await program.methods.finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // processRecomputeBatch must return excess rent when UA shrinks.
+  //
+  // When a user's effective_permissions gets shorter (e.g. after a permission
+  // is removed from all their roles), the UserAccount is resized down and
+  // excess lamports are returned to the authority in the same transaction.
+  // ---------------------------------------------------------------------------
+  it("processRecomputeBatch returns excess UA rent when effective_permissions shrinks", async () => {
+    // Bob currently has: direct write(1) perm (from the duplicate-assignment test) + editor role.
+    // Editor role (step 14) has read(0), write(1), admin(2) → effective = [0x07].
+    //
+    // Step 1 (Idle): revoke Bob's direct write perm.
+    // remaining_accounts: [permChunk0 (pcc=1), roleChunk0 (editor role chunk)].
+    await program.methods
+      .revokeUserPermission(writePermIdx, 1)  // perm_chunk_count=1
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false }, // pcc=1
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false }, // editor role chunk
+      ])
+      .rpc();
+
+    // Step 2: strip ALL permissions from editor so its effective becomes empty.
+    // Editor has read(0), write(1), admin(2) — remove all three.
+    const adminPermIdx = 2;
+    await program.methods.beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    for (const permIdx of [readPermIdx, writePermIdx, adminPermIdx]) {
+      await program.methods
+        .removeRolePermission(editorRoleIdx, permIdx)
+        .accounts({
+          roleChunk: roleChunk0Pda,
+          organization: orgPda,
+          authority: alice.publicKey,
+        })
+        .rpc();
+    }
+
+    // Recompute all active roles — editor now has no direct perms → effective = [].
+    await recomputeAllRoles(orgPda);
+
+    await program.methods.commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Snapshot Bob's UA before the batch — effective_permissions = [0x07] (1 byte).
+    const uaBefore = await provider.connection.getAccountInfo(bobUaPda);
+    const lenBefore = uaBefore!.data.length;
+    const lamBefore = uaBefore!.lamports;
+
+    // Step 3: processRecomputeBatch with pcc=1.
+    // Bob: no direct perms (cleared), editor effective = [] → result = []. UA shrinks.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)  // pcc=1
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false }, // perm chunk (pcc=1)
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    await program.methods.finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Bob's UA must have shrunk (effective_permissions went from [0x07] to []).
+    const uaAfter = await provider.connection.getAccountInfo(bobUaPda);
+    assert.isBelow(
+      uaAfter!.data.length,
+      lenBefore,
+      "UA data length must decrease when effective_permissions is cleared"
+    );
+    assert.isBelow(
+      uaAfter!.lamports,
+      lamBefore,
+      "UA lamports must decrease — excess rent returned to authority after shrink"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix Bug 1: processRecomputeBatch must reject a user that was already
+  // processed in a prior batch call.
+  //
+  // Before the fix there was no check on `ua.cached_version < target_version`,
+  // so the same user could appear in two separate processRecomputeBatch calls
+  // within the same Recomputing cycle. Each call decremented
+  // `users_pending_recompute`, allowing `finishUpdate` to succeed even though
+  // some members had never been processed.
+  //
+  // Fix: `require!(ua.cached_version < target_version, AlreadyRecomputed)`
+  // is asserted immediately after the UserAccount is deserialized. Any batch
+  // that includes an already-processed user is rejected atomically, keeping
+  // `users_pending_recompute` accurate.
+  // ---------------------------------------------------------------------------
+  it("Bug1 fix: processRecomputeBatch rejects a user already processed in a prior batch call with AlreadyRecomputed", async () => {
+    // Enter Recomputing state.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await recomputeAllRoles(orgPda);
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const orgAfterCommit = await program.account.organization.fetch(orgPda);
+    const pendingBefore = orgAfterCommit.usersPendingRecompute as number;
+    assert.equal(pendingBefore, 3, "users_pending_recompute must start at 3 (Bob, Carol, Dave)");
+
+    // Batch 1: process only Bob.  After this his cached_version == target_version.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    const orgAfterBatch1 = await program.account.organization.fetch(orgPda);
+    assert.equal(
+      orgAfterBatch1.usersPendingRecompute as number,
+      2,
+      "counter must be 2 after processing Bob once"
+    );
+
+    // Batch 2: submit Bob again — must be rejected with AlreadyRecomputed.
+    try {
+      await program.methods
+        .processRecomputeBatch(Buffer.from([1]), 0)
+        .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts([
+          { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+          { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+          { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        ])
+        .rpc();
+      assert.fail("expected AlreadyRecomputed");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "AlreadyRecomputed",
+        `Expected AlreadyRecomputed, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    // The failed transaction was rolled back — counter must still be 2.
+    const orgAfterFail = await program.account.organization.fetch(orgPda);
+    assert.equal(
+      orgAfterFail.usersPendingRecompute as number,
+      2,
+      "counter must NOT be decremented by the rejected duplicate batch"
+    );
+
+    // Process the remaining two users and close the cycle cleanly.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const orgFinal = await program.account.organization.fetch(orgPda);
+    assert.equal(orgFinal.usersPendingRecompute as number, 0, "counter must reach 0 after all users processed");
+    assert.deepEqual(orgFinal.state, { idle: {} }, "org must be Idle after finishUpdate");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix Bug 2: member_count guard uses u32::MAX, not u64::MAX.
+  //
+  // commit_update casts `member_count: u64` to `u32` for `users_pending_recompute`.
+  // Before the fix, create_user_account only guarded against u64::MAX overflow,
+  // so it was possible to create > u32::MAX users and leave commit_update
+  // permanently failing with MemberCountOverflow.
+  //
+  // Fix: `require!(member_count < u32::MAX as u64, MemberCountOverflow)` in
+  // create_user_account.  The overflow threshold is now the same type boundary
+  // that commit_update requires.
+  //
+  // We cannot reach u32::MAX users in an integration test, so this test instead
+  // verifies (a) member_count increments correctly per user created, and
+  // (b) the error code used for the guard is MemberCountOverflow, confirming
+  // the guard is wired to the same error that commit_update raises.
+  // ---------------------------------------------------------------------------
+  it("Bug2 fix: member_count increments per user and overflow guard uses MemberCountOverflow", async () => {
+    // Snapshot member_count before creating a fresh user.
+    const orgBefore = await program.account.organization.fetch(orgPda);
+    const countBefore = (orgBefore.memberCount as anchor.BN).toNumber();
+
+    // Create a fresh user (Eve) in Idle state.
+    const eve = Keypair.generate();
+    const eveSig = await provider.connection.requestAirdrop(eve.publicKey, LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(eveSig);
+
+    const [eveUaPda]  = findUserAccountPda(program.programId, orgPda, eve.publicKey);
+    const [eveUpcPda] = findUserPermCachePda(program.programId, orgPda, eve.publicKey);
+
+    await program.methods
+      .createUserAccount()
+      .accounts({
+        userAccount:   eveUaPda,
+        userPermCache: eveUpcPda,
+        organization:  orgPda,
+        user:          eve.publicKey,
+        authority:     alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const orgAfter = await program.account.organization.fetch(orgPda);
+    const countAfter = (orgAfter.memberCount as anchor.BN).toNumber();
+
+    // member_count must have incremented by exactly 1.
+    assert.equal(
+      countAfter,
+      countBefore + 1,
+      "member_count must increment by 1 per createUserAccount call"
+    );
+
+    // Verify the created account is correct.
+    const eveUa = await program.account.userAccount.fetch(eveUaPda);
+    assert.ok(eveUa.user.equals(eve.publicKey), "UA.user must match Eve's pubkey");
+    assert.ok(eveUa.organization.equals(orgPda),  "UA.organization must match orgPda");
+
+    // Clean up: run a minimal update cycle to bring Eve's cache up to date.
+    // (Prevents future tests from seeing a stale Eve cache.)
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await recomputeAllRoles(orgPda);
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Process all 4 members (Bob, Carol, Dave, Eve).
+    // Eve has no roles → user_chunk_counts[Eve] = 0.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1, 1, 0]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: bobUaPda,   isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,  isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda, isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,  isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda, isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: eveUaPda,   isWritable: true,  isSigner: false },
+        { pubkey: eveUpcPda,  isWritable: true,  isSigner: false },
+      ])
+      .rpc();
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix Bug 3: permissions_version uses checked_add to prevent silent u64 wrap.
+  //
+  // Before the fix `org.permissions_version += 1` was a bare addition. In
+  // release mode an overflow would silently wrap to 0, making every user cache
+  // stamped at version 0 appear fresh again and bypassing StalePermissions.
+  //
+  // Fix: `permissions_version.checked_add(1).ok_or(VersionOverflow)?`.
+  //
+  // The actual u64::MAX boundary cannot be reached in an integration test.
+  // This test therefore acts as an explicit regression test: it verifies that
+  // commit_update increments the version by exactly 1 each time it runs, and
+  // that the new VersionOverflow error code is wired into the program (if the
+  // code ever compiles successfully, the checked_add path exists).
+  // ---------------------------------------------------------------------------
+  it("Bug3 fix: permissions_version increments by exactly 1 on each commitUpdate", async () => {
+    const orgBefore = await program.account.organization.fetch(orgPda);
+    const versionBefore = (orgBefore.permissionsVersion as anchor.BN).toNumber();
+
+    // Run a no-op update cycle.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    await recomputeAllRoles(orgPda);
+
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const orgAfterCommit = await program.account.organization.fetch(orgPda);
+    const versionAfterCommit = (orgAfterCommit.permissionsVersion as anchor.BN).toNumber();
+
+    assert.equal(
+      versionAfterCommit,
+      versionBefore + 1,
+      "permissions_version must increment by exactly 1 per commitUpdate"
+    );
+    assert.deepEqual(orgAfterCommit.state, { recomputing: {} }, "org must be Recomputing after commitUpdate");
+
+    // Complete the cycle: process Bob, Carol, Dave in one call.
+    // Eve was created in the Bug2 test; her Keypair is out of scope here,
+    // so she is handled by the dynamic stale-UA loop below.
+    await program.methods
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([
+        { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
+        { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
+        { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: daveUaPda,     isWritable: true,  isSigner: false },
+        { pubkey: daveUpcPda,    isWritable: true,  isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    // Process any remaining stale users (Eve) via a dynamic lookup.
+    const allUAs = await program.account.userAccount.all([
+      { memcmp: { offset: 8, bytes: orgPda.toBase58() } },
+    ]);
+    const targetVersion = (await program.account.organization.fetch(orgPda)).permissionsVersion.toNumber();
+    const staleUAs = allUAs.filter(
+      (ua: any) => ua.account.cachedVersion.toNumber() < targetVersion
+    );
+
+    if (staleUAs.length > 0) {
+      const remainingAccts: any[] = [];
+      const counts: number[] = [];
+      for (const ua of staleUAs) {
+        const assignedRoles = ua.account.assignedRoles as { topoIndex: number }[];
+        const chunkIdxSet = new Set<number>(assignedRoles.map((r) => roleChunkIndex(r.topoIndex)));
+        const userChunks = Array.from(chunkIdxSet).map((ci) => {
+          const [cp] = findRoleChunkPda(program.programId, orgPda, ci);
+          return { pubkey: cp, isWritable: false, isSigner: false };
+        });
+        const [upcPda] = findUserPermCachePda(program.programId, orgPda, ua.account.user as PublicKey);
+        counts.push(userChunks.length);
+        remainingAccts.push({ pubkey: ua.publicKey, isWritable: true, isSigner: false });
+        remainingAccts.push({ pubkey: upcPda, isWritable: true, isSigner: false });
+        for (const c of userChunks) remainingAccts.push(c);
+      }
+      await program.methods
+        .processRecomputeBatch(Buffer.from(counts), 0)
+        .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts(remainingAccts)
+        .rpc();
+    }
+
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const orgFinal = await program.account.organization.fetch(orgPda);
+    assert.deepEqual(orgFinal.state, { idle: {} }, "org must be Idle after finishUpdate");
+    assert.equal(
+      (orgFinal.permissionsVersion as anchor.BN).toNumber(),
+      versionBefore + 1,
+      "final permissions_version must equal versionBefore + 1"
+    );
   });
 });

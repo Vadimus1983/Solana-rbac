@@ -20,7 +20,7 @@ pub fn handler(ctx: Context<FinishUpdate>) -> Result<()> {
     let org = &mut ctx.accounts.organization;
     require!(org.state == OrgState::Recomputing, RbacError::OrgNotRecomputing);
 
-    // Issue #8: all member UserAccounts must have been processed by
+    // All member UserAccounts must have been processed by
     // process_recompute_batch before the cycle can be closed.
     require!(
         org.users_pending_recompute == 0,

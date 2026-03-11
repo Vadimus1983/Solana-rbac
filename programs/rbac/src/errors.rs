@@ -74,11 +74,33 @@ pub enum RbacError {
     #[msg("Required chunk account not found in remaining_accounts")]
     ChunkNotFound,
 
-    /// Issue #3 / #6 — permission is soft-deleted and must not be assigned.
     #[msg("Permission is inactive (soft-deleted) and cannot be assigned or added to a role")]
     PermissionInactive,
 
-    /// Issue #8 — all roles must be recomputed before commit_update, all users before finish_update.
     #[msg("Update incomplete: not all roles/users have been recomputed yet")]
     UpdateIncomplete,
+
+    /// Idempotency guard: recompute_role was already called for this role in the current update cycle.
+    #[msg("Role was already recomputed in this update cycle")]
+    AlreadyRecomputed,
+
+    /// member_count exceeds the u32 range required for users_pending_recompute.
+    #[msg("Member count exceeds u32 maximum; cannot track recompute progress")]
+    MemberCountOverflow,
+
+    /// role_count or active_role_count wrapped around u32::MAX.
+    #[msg("Role count exceeds u32 maximum")]
+    RoleCountOverflow,
+
+    /// Permission is not directly assigned to this user or role.
+    #[msg("Permission is not directly assigned to this user or role")]
+    PermissionNotAssigned,
+
+    /// Permission is already directly assigned to this role.
+    #[msg("Permission is already directly assigned to this role")]
+    PermissionAlreadyAssigned,
+
+    /// permissions_version wrapped around u64::MAX.
+    #[msg("Permissions version overflow")]
+    VersionOverflow,
 }

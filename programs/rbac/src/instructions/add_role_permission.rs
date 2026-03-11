@@ -19,7 +19,7 @@ pub struct AddRolePermission<'info> {
     pub role_chunk: Account<'info, RoleChunk>,
 
     /// The chunk containing the permission. Read-only; used to verify the
-    /// permission is still active (Issue #6 fix).
+    /// permission is still active before assigning it.
     #[account(
         seeds = [
             b"perm_chunk",
@@ -53,8 +53,8 @@ pub fn handler(
     require!(org.state == OrgState::Updating, RbacError::OrgNotInUpdateMode);
     require!(permission_index < org.next_permission_index, RbacError::InvalidPermissionIndex);
 
-    // Issue #6: reject soft-deleted permissions — recompute_role would drop them
-    // anyway, but this gives an immediate, clear error at the call site.
+    // Reject soft-deleted permissions — recompute_role would drop them anyway,
+    // but this gives an immediate, clear error at the call site.
     let perm_slot = permission_index as usize % PERMS_PER_CHUNK;
     let perm_chunk = &ctx.accounts.perm_chunk;
     require!(perm_slot < perm_chunk.entries.len(), RbacError::PermSlotEmpty);
@@ -74,6 +74,8 @@ pub fn handler(
         let entry = &chunk.entries[slot];
         require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
         require!(entry.active, RbacError::RoleInactive);
+        // Reject duplicate additions — version would bump unnecessarily.
+        require!(!has_bit(&entry.direct_permissions, permission_index), RbacError::PermissionAlreadyAssigned);
     }
 
     // Compute growth needed to hold this bit index.

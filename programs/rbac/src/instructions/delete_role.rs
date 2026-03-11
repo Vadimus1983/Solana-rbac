@@ -43,16 +43,27 @@ pub fn handler(ctx: Context<DeleteRole>, role_index: u32) -> Result<()> {
     require!(entry.active, RbacError::RoleInactive);
 
     let name = entry.name.clone();
+    // Capture whether this role has already been recomputed in the current
+    // update cycle BEFORE modifying the entry. If it hasn't, releasing its
+    // pending slot allows commit_update to complete after the deletion.
+    let already_recomputed_this_cycle =
+        entry.recompute_epoch == ctx.accounts.organization.permissions_version;
     entry.active = false;
     entry.direct_permissions.clear();
     entry.effective_permissions.clear();
     entry.children.clear();
     entry.version += 1;
 
-    // Issue #8: keep active_role_count in sync so begin_update can seed
+    // Keep active_role_count in sync so begin_update can seed
     // roles_pending_recompute with the correct number of live roles.
     ctx.accounts.organization.active_role_count =
         ctx.accounts.organization.active_role_count.saturating_sub(1);
+    // Release the pending-recompute slot so the update cycle can still close
+    // when a role is deleted before being recomputed this cycle.
+    if !already_recomputed_this_cycle {
+        ctx.accounts.organization.roles_pending_recompute =
+            ctx.accounts.organization.roles_pending_recompute.saturating_sub(1);
+    }
 
     emit!(RoleDeleted {
         organization: ctx.accounts.organization.key(),

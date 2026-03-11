@@ -40,6 +40,8 @@ pub fn handler(ctx: Context<RemoveRolePermission>, role_index: u32, permission_i
     let entry = &mut chunk.entries[slot];
     require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
     require!(entry.active, RbacError::RoleInactive);
+    // Reject no-op removals — the permission must actually be assigned to this role.
+    require!(has_bit(&entry.direct_permissions, permission_index), RbacError::PermissionNotAssigned);
 
     clear_bit(&mut entry.direct_permissions, permission_index);
     entry.version += 1;

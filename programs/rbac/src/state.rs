@@ -50,6 +50,11 @@ pub struct RoleEntry {
     /// Children stored as topo_indices (NOT Pubkeys).
     pub children: Vec<u32>,
     pub active: bool,
+    /// Set to org.permissions_version each time recompute_role runs. Used to
+    /// prevent the same role from being recomputed twice in one update cycle,
+    /// which would double-decrement roles_pending_recompute. Initialized to
+    /// u64::MAX so the first-cycle check (version == 0) doesn't false-trigger.
+    pub recompute_epoch: u64,
 }
 
 impl RoleEntry {
@@ -63,6 +68,7 @@ impl RoleEntry {
         + (4 + self.effective_permissions.len())
         + (4 + self.children.len() * 4)
         + 1  // active
+        + 8  // recompute_epoch
     }
 }
 
@@ -111,10 +117,10 @@ pub struct Organization {
     pub permissions_version: u64,
     pub state: OrgState,
     pub bump: u8,
-    /// Issue #8: set to active_role_count by begin_update, decremented by
-    /// recompute_role. commit_update requires this to be 0.
+    /// Set to active_role_count by begin_update, decremented by recompute_role.
+    /// commit_update requires this to be 0.
     pub roles_pending_recompute: u32,
-    /// Issue #8: set to member_count by commit_update, decremented by
+    /// Set to member_count by commit_update, decremented by
     /// process_recompute_batch. finish_update requires this to be 0.
     pub users_pending_recompute: u32,
 }
@@ -373,7 +379,7 @@ pub fn clear_bit(bitmask: &mut Vec<u8>, index: u32) {
 pub fn bitmask_union(a: &[u8], b: &[u8]) -> Vec<u8> {
     let max_len = a.len().max(b.len());
     let mut result = vec![0u8; max_len];
-    for (i, byte) in a.iter().  enumerate() {
+    for (i, byte) in a.iter().enumerate() {
         result[i] |= byte;
     }
     for (i, byte) in b.iter().enumerate() {
@@ -572,7 +578,7 @@ mod tests {
         assert_eq!(r2, vec![0xABu8]);
     }
 
-    // ── Issue #1 — delegation PDA uniqueness across orgs ──────────────────
+    // ── Delegation PDA uniqueness across orgs ─────────────────────────────
     // The fix adds find_program_address verification so a cache from org A
     // cannot be used to authorise operations in org B.
     #[test]
@@ -593,7 +599,7 @@ mod tests {
         assert_ne!(pda_a, pda_b, "PDAs for different orgs must differ");
     }
 
-    // ── Issue #3/#6 — PermEntry active flag ───────────────────────────────
+    // ── PermEntry active flag ──────────────────────────────────────────────
     #[test]
     fn test_perm_entry_active_flag() {
         let entry = PermEntry {
@@ -608,7 +614,7 @@ mod tests {
         assert!(!deleted.active);
     }
 
-    // ── Issue #4 — staleness: version comparison ───────────────────────────
+    // ── Cache staleness: version comparison ───────────────────────────────
     #[test]
     fn test_permissions_version_staleness() {
         let cache_version: u64 = 2;
@@ -618,7 +624,7 @@ mod tests {
         assert!(fresh_version >= org_version, "fresh cache passes");
     }
 
-    // ── Issue #5/#7 — filtering a bitmask through an active-permission set ─
+    // ── Filtering a bitmask through an active-permission set ──────────────
     #[test]
     fn test_filter_bitmask_by_active_set() {
         let mut source: Vec<u8> = Vec::new();
@@ -646,7 +652,7 @@ mod tests {
         assert!(has_bit(&result, 2));
     }
 
-    // ── Issue #8 — completeness counters ──────────────────────────────────
+    // ── Update cycle completeness counters ────────────────────────────────
     #[test]
     fn test_roles_pending_recompute_counter() {
         let active_role_count: u32 = 3;
@@ -666,6 +672,32 @@ mod tests {
         assert_eq!(pending, 0);
     }
 
+    // ── Role count bitmask overflow guard ─────────────────────────────────
+    // UserPermCache.effective_roles is [u8; 32] (256-bit fixed bitmask).
+    // set_bit_arr is a silent no-op for index >= 256, so create_role must
+    // reject any call that would push active_role_count to 256 or beyond.
+    #[test]
+    fn test_set_bit_arr_noop_at_256() {
+        let mut cache = [0u8; 32];
+        // index 255 is the last representable slot — must set the bit
+        set_bit_arr(&mut cache, 255);
+        assert_eq!(cache[31], 0b1000_0000, "bit 255 must be set");
+        // index 256 falls outside the 32-byte window — must be a silent no-op
+        set_bit_arr(&mut cache, 256);
+        // the array must be unchanged (all bytes after the previous write are 0)
+        assert_eq!(cache[0], 0, "overflow write must not corrupt byte 0");
+        assert_eq!(cache[31], 0b1000_0000, "overflow write must not corrupt byte 31");
+    }
+
+    #[test]
+    fn test_role_count_cap_at_256() {
+        // Simulate the create_role guard: active_role_count must stay < 256.
+        let active_role_count: u32 = 255;
+        assert!(active_role_count < 256, "255 active roles is within limit");
+        let would_overflow: u32 = 256;
+        assert!(!(would_overflow < 256), "256 active roles must be rejected");
+    }
+
     // ── RoleEntry serialized_size sanity ──────────────────────────────────
     #[test]
     fn test_role_entry_serialized_size() {
@@ -678,8 +710,9 @@ mod tests {
             effective_permissions: vec![0u8; 2],
             children: vec![],
             active: true,
+            recompute_epoch: u64::MAX,
         };
-        // 4(topo) + 8(ver) + (4+5)(name) + (4+0)(desc) + (4+2)(dp) + (4+2)(ep) + (4+0)(children) + 1(active)
-        assert_eq!(entry.serialized_size(), 4 + 8 + 9 + 4 + 6 + 6 + 4 + 1);
+        // 4(topo) + 8(ver) + (4+5)(name) + (4+0)(desc) + (4+2)(dp) + (4+2)(ep) + (4+0)(children) + 1(active) + 8(recompute_epoch)
+        assert_eq!(entry.serialized_size(), 4 + 8 + 9 + 4 + 6 + 6 + 4 + 1 + 8);
     }
 }

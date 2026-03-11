@@ -25,6 +25,7 @@ pub struct RemoveChildRole<'info> {
     )]
     pub organization: Account<'info, Organization>,
 
+    #[account(mut)]
     pub authority: Signer<'info>,
 }
 
@@ -47,6 +48,22 @@ pub fn handler(ctx: Context<RemoveChildRole>, parent_index: u32, child_index: u3
     require!(pos.is_some(), RbacError::RoleNotAssigned);
     entry.children.swap_remove(pos.unwrap());
     entry.version += 1;
+
+    // Reclaim the 4 bytes freed by swap_remove so lamports are not locked
+    // indefinitely (add_child_role allocates +4 bytes; mirror that here).
+    {
+        let current_len = chunk.to_account_info().data_len();
+        let new_space = current_len - 4;
+        chunk.to_account_info().resize(new_space)?;
+        let rent = Rent::get()?;
+        let new_min = rent.minimum_balance(new_space);
+        let current_lamports = chunk.to_account_info().lamports();
+        if current_lamports > new_min {
+            let excess = current_lamports - new_min;
+            **chunk.to_account_info().try_borrow_mut_lamports()? -= excess;
+            **ctx.accounts.authority.to_account_info().try_borrow_mut_lamports()? += excess;
+        }
+    }
 
     emit!(ChildRoleRemoved {
         organization: org_key,

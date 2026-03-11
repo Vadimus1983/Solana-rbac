@@ -357,8 +357,18 @@ export async function txAddChildRole(
   authority: PublicKey
 ): Promise<string> {
   const [orgPda] = findOrgPda(orgName);
-  const chunkIdx = roleChunkIndex(parentIndex);
-  const [roleChunkPda] = findRoleChunkPda(orgPda, chunkIdx);
+  const parentChunkIdx = roleChunkIndex(parentIndex);
+  const childChunkIdx = roleChunkIndex(childIndex);
+  const [roleChunkPda] = findRoleChunkPda(orgPda, parentChunkIdx);
+
+  // If parent and child live in different chunks, the on-chain handler requires
+  // the child's RoleChunk in remaining_accounts[0] for cross-chunk validation.
+  const remainingAccounts: AccountMeta[] = [];
+  if (childChunkIdx !== parentChunkIdx) {
+    const [childChunkPda] = findRoleChunkPda(orgPda, childChunkIdx);
+    remainingAccounts.push({ pubkey: childChunkPda, isSigner: false, isWritable: false });
+  }
+
   return (program.methods as any)
     .addChildRole(parentIndex, childIndex)
     .accounts({
@@ -367,6 +377,7 @@ export async function txAddChildRole(
       authority,
       systemProgram: SystemProgram.programId,
     })
+    .remainingAccounts(remainingAccounts)
     .rpc();
 }
 
@@ -590,14 +601,28 @@ export async function txAssignRole(
   orgName: string,
   userKey: PublicKey,
   roleIndex: number,
+  roleEffectivePermissions: Uint8Array,
   authority: PublicKey
 ): Promise<string> {
   const [orgPda] = findOrgPda(orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   const [roleChunkPda] = findRoleChunkPda(orgPda, roleChunkIndex(roleIndex));
+
+  // Build PermChunk accounts for active-permission filtering.
+  // The on-chain handler strips any stale deleted-permission bits from the
+  // role's effective_permissions before merging them into the user's cache.
+  const uniquePermChunkIndices = new Set(
+    bitmaskToIndices(roleEffectivePermissions).map(permChunkIndex)
+  );
+  const remainingAccounts: AccountMeta[] = [];
+  for (const ci of uniquePermChunkIndices) {
+    const [pda] = findPermChunkPda(orgPda, ci);
+    remainingAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
+  }
+
   return (program.methods as any)
-    .assignRole(roleIndex, 0)  // pcc=0: trust cached effective_perms (no filtering)
+    .assignRole(roleIndex, remainingAccounts.length)
     .accounts({
       userAccount: userAccountPda,
       userPermCache: userPermCachePda,
@@ -606,6 +631,7 @@ export async function txAssignRole(
       authority,
       systemProgram: SystemProgram.programId,
     })
+    .remainingAccounts(remainingAccounts)
     .rpc();
 }
 
@@ -622,7 +648,7 @@ export async function txRevokeRole(
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
 
-  // Perm chunks for filtering direct_permissions (Issue #2 fix — first in remaining_accounts)
+  // Perm chunks for filtering direct_permissions (first in remaining_accounts)
   const uniquePermChunkIndices = new Set(
     bitmaskToIndices(directPermissions).map(permChunkIndex)
   );
@@ -693,7 +719,7 @@ export async function txRevokeUserPermission(
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
 
   // Compute remaining direct perm indices after clearing the revoked bit,
-  // then build perm chunk accounts for filtering (Issue #2 fix — first in remaining_accounts).
+  // then build perm chunk accounts for filtering (first in remaining_accounts).
   const afterClear = directPermissions.slice();
   const byteIdx = Math.floor(permissionIndex / 8);
   if (byteIdx < afterClear.length) afterClear[byteIdx] &= ~(1 << (permissionIndex % 8));

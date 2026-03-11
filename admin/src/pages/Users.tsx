@@ -130,8 +130,10 @@ export default function Users({
   const handleAssignRole = async () => {
     if (!userData || assignRoleIdx === "" || !wallet.publicKey) return;
     const program = getProgram(connection, wallet);
+    const role = allRoles.find((r) => r.topoIndex === assignRoleIdx);
+    const effectivePerms = role ? role.effectivePermissions : new Uint8Array();
     const ok = await run(`Assign Role #${assignRoleIdx}`, () =>
-      txAssignRole(program, orgName, userData.user, assignRoleIdx as number, wallet.publicKey!)
+      txAssignRole(program, orgName, userData.user, assignRoleIdx as number, effectivePerms, wallet.publicKey!)
     );
     if (ok) { setAssignRoleIdx(""); await refreshUser(); }
   };

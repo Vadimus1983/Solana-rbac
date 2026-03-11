@@ -39,7 +39,7 @@ pub fn handler(ctx: Context<DeletePermission>, perm_index: u32) -> Result<()> {
     require!(slot < chunk.entries.len(), RbacError::PermSlotEmpty);
     let entry = &mut chunk.entries[slot];
     require!(entry.index == perm_index, RbacError::PermSlotEmpty);
-    require!(entry.active, RbacError::InvalidPermissionIndex);
+    require!(entry.active, RbacError::PermissionInactive);
 
     entry.active = false;
 
