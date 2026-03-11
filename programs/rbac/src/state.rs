@@ -1,4 +1,6 @@
 use anchor_lang::prelude::*;
+use std::collections::HashMap;
+
 use crate::errors::RbacError;
 
 pub const MAX_ORG_NAME_LEN: usize = 32;
@@ -511,6 +513,92 @@ pub fn find_role_chunk_in_accounts<'info>(
         }
     }
     err!(RbacError::ChunkNotFound)
+}
+
+// ---------------------------------------------------------------------------
+// Chunk indices: build once per instruction, O(1) lookups
+// ---------------------------------------------------------------------------
+
+/// Build a map of chunk_index -> PermChunk from a slice of accounts.
+/// One pass over accounts; all later lookups are O(1).
+pub fn build_perm_chunk_index<'info>(
+    accounts: &[AccountInfo<'info>],
+    org_key: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<HashMap<u32, PermChunk>> {
+    let mut index = HashMap::new();
+    for ai in accounts.iter() {
+        if ai.owner != program_id {
+            continue;
+        }
+        let data = match ai.try_borrow_data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() < PermChunk::BASE_SIZE {
+            continue;
+        }
+        if let Ok(chunk) = PermChunk::try_deserialize(&mut &data[..]) {
+            if chunk.organization != *org_key {
+                continue;
+            }
+            let chunk_idx = chunk.chunk_index;
+            let chunk_idx_bytes = chunk_idx.to_le_bytes();
+            let seeds: &[&[u8]] = &[
+                b"perm_chunk",
+                org_key.as_ref(),
+                &chunk_idx_bytes,
+                &[chunk.bump],
+            ];
+            if let Ok(derived) = Pubkey::create_program_address(seeds, program_id) {
+                if derived == ai.key() {
+                    index.insert(chunk_idx, chunk);
+                }
+            }
+        }
+    }
+    Ok(index)
+}
+
+/// Build a map of chunk_index -> RoleChunk from a slice of accounts.
+/// One pass over accounts; all later lookups are O(1).
+pub fn build_role_chunk_index<'info>(
+    accounts: &[AccountInfo<'info>],
+    org_key: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<HashMap<u32, RoleChunk>> {
+    let mut index = HashMap::new();
+    for ai in accounts.iter() {
+        if ai.owner != program_id {
+            continue;
+        }
+        let data = match ai.try_borrow_data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() < RoleChunk::BASE_SIZE {
+            continue;
+        }
+        if let Ok(chunk) = RoleChunk::try_deserialize(&mut &data[..]) {
+            if chunk.organization != *org_key {
+                continue;
+            }
+            let chunk_idx = chunk.chunk_index;
+            let chunk_idx_bytes = chunk_idx.to_le_bytes();
+            let seeds: &[&[u8]] = &[
+                b"role_chunk",
+                org_key.as_ref(),
+                &chunk_idx_bytes,
+                &[chunk.bump],
+            ];
+            if let Ok(derived) = Pubkey::create_program_address(seeds, program_id) {
+                if derived == ai.key() {
+                    index.insert(chunk_idx, chunk);
+                }
+            }
+        }
+    }
+    Ok(index)
 }
 
 // ---------------------------------------------------------------------------

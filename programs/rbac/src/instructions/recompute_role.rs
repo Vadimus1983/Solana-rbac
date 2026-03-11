@@ -74,6 +74,14 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     let perm_accounts = &ctx.remaining_accounts[..pcc];
     let role_accounts = &ctx.remaining_accounts[pcc..];
 
+    // Index chunks once for O(1) lookups.
+    let perm_index = if pcc > 0 {
+        Some(build_perm_chunk_index(perm_accounts, &org_key, ctx.program_id)?)
+    } else {
+        None
+    };
+    let role_chunk_index = build_role_chunk_index(role_accounts, &org_key, ctx.program_id)?;
+
     // Build effective_permissions starting from direct_permissions,
     // but only include bits whose corresponding PermEntry is still active.
     let mut result: Vec<u8> = Vec::new();
@@ -83,22 +91,20 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         }
         for bit in 0..8u32 {
             if byte & (1 << bit) != 0 {
-                let perm_index = (byte_idx as u32) * 8 + bit;
-                let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
-                let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                let perm_index_val = (byte_idx as u32) * 8 + bit;
+                let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
+                let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
 
-                let perm_chunk = find_perm_chunk_in_accounts(
-                    perm_accounts,
-                    &org_key,
-                    perm_chunk_idx,
-                    ctx.program_id,
-                )?;
+                let perm_chunk = perm_index
+                    .as_ref()
+                    .and_then(|idx| idx.get(&perm_chunk_idx))
+                    .ok_or(RbacError::ChunkNotFound)?;
 
                 if perm_slot < perm_chunk.entries.len()
-                    && perm_chunk.entries[perm_slot].index == perm_index
+                    && perm_chunk.entries[perm_slot].index == perm_index_val
                     && perm_chunk.entries[perm_slot].active
                 {
-                    set_bit(&mut result, perm_index);
+                    set_bit(&mut result, perm_index_val);
                 }
                 // If inactive or not found in entries — bit is silently dropped.
             }
@@ -125,12 +131,9 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
                 Vec::new()
             }
         } else {
-            let child_chunk = find_role_chunk_in_accounts(
-                role_accounts,
-                &org_key,
-                child_chunk_idx,
-                ctx.program_id,
-            )?;
+            let child_chunk = role_chunk_index
+                .get(&child_chunk_idx)
+                .ok_or(RbacError::ChunkNotFound)?;
             if child_slot < child_chunk.entries.len() {
                 let ce = &child_chunk.entries[child_slot];
                 if ce.active && ce.topo_index == child_topo {
@@ -146,23 +149,22 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         // Filter child_eff through PermChunks before merging — same approach
         // as for direct_permissions above.
         for (byte_idx, &byte) in child_eff.iter().enumerate() {
-            if byte == 0 { continue; }
+            if byte == 0 {
+                continue;
+            }
             for bit in 0..8u32 {
                 if byte & (1 << bit) != 0 {
-                    let perm_index = (byte_idx as u32) * 8 + bit;
-                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
-                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
-                    if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
-                        perm_accounts,
-                        &org_key,
-                        perm_chunk_idx,
-                        ctx.program_id,
-                    ) {
+                    let perm_index_val = (byte_idx as u32) * 8 + bit;
+                    let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
+                    if let Some(perm_chunk) =
+                        perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
+                    {
                         if perm_slot < perm_chunk.entries.len()
-                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].index == perm_index_val
                             && perm_chunk.entries[perm_slot].active
                         {
-                            set_bit(&mut result, perm_index);
+                            set_bit(&mut result, perm_index_val);
                         }
                         // inactive or not found → bit dropped
                     }

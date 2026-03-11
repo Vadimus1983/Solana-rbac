@@ -60,6 +60,13 @@ pub fn handler(
     // artificially decrementing users_pending_recompute below the real count.
     let mut processed_users: std::collections::BTreeSet<Pubkey> = std::collections::BTreeSet::new();
 
+    // Index perm chunks once for O(1) lookups.
+    let perm_index = if pcc > 0 {
+        Some(build_perm_chunk_index(perm_accounts, &org_key, ctx.program_id)?)
+    } else {
+        None
+    };
+
     for &chunk_count in user_chunk_counts.iter() {
         // Need at least UA + UPC.
         require!(offset + 1 < remaining.len(), RbacError::AccountCountMismatch);
@@ -79,6 +86,9 @@ pub fn handler(
         // Slice of chunk accounts for this user.
         let user_chunks = &remaining[offset..offset + cc];
         offset += cc;
+
+        // Index this user's role chunks once for O(1) lookups.
+        let role_index = build_role_chunk_index(user_chunks, &org_key, ctx.program_id)?;
 
         let mut ua = {
             let data = ua_info
@@ -127,26 +137,24 @@ pub fn handler(
             }
             for bit in 0..8u32 {
                 if byte & (1 << bit) != 0 {
-                    let perm_index = (byte_idx as u32) * 8 + bit;
-                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
-                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                    let perm_index_val = (byte_idx as u32) * 8 + bit;
+                    let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
                     if pcc > 0 {
-                        let perm_chunk = find_perm_chunk_in_accounts(
-                            perm_accounts,
-                            &org_key,
-                            perm_chunk_idx,
-                            ctx.program_id,
-                        )?;
+                        let perm_chunk = perm_index
+                            .as_ref()
+                            .and_then(|idx| idx.get(&perm_chunk_idx))
+                            .ok_or(RbacError::ChunkNotFound)?;
                         if perm_slot < perm_chunk.entries.len()
-                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].index == perm_index_val
                             && perm_chunk.entries[perm_slot].active
                         {
-                            set_bit(&mut result, perm_index);
+                            set_bit(&mut result, perm_index_val);
                         }
                         // inactive permission — silently dropped
                     } else {
                         // No perm chunks passed — include bit as-is.
-                        set_bit(&mut result, perm_index);
+                        set_bit(&mut result, perm_index_val);
                     }
                 }
             }
@@ -160,7 +168,9 @@ pub fn handler(
         for role_ref in ua.assigned_roles.iter() {
             let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;
             let slot = role_ref.topo_index as usize % ROLES_PER_CHUNK;
-            let chunk = find_role_chunk_in_accounts(user_chunks, &org_key, chunk_idx, ctx.program_id)?;
+            let chunk = role_index
+                .get(&chunk_idx)
+                .ok_or(RbacError::ChunkNotFound)?;
             let entry = &chunk.entries[slot];
             if entry.active {
                 active_role_indices.push(role_ref.topo_index);
@@ -174,27 +184,24 @@ pub fn handler(
                     }
                     for bit in 0..8u32 {
                         if byte & (1 << bit) != 0 {
-                            let perm_index = (byte_idx as u32) * 8 + bit;
-                            let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
-                            let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
+                            let perm_index_val = (byte_idx as u32) * 8 + bit;
+                            let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
+                            let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
                             if pcc > 0 {
-                                if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
-                                    perm_accounts,
-                                    &org_key,
-                                    perm_chunk_idx,
-                                    ctx.program_id,
-                                ) {
+                                if let Some(perm_chunk) =
+                                    perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
+                                {
                                     if perm_slot < perm_chunk.entries.len()
-                                        && perm_chunk.entries[perm_slot].index == perm_index
+                                        && perm_chunk.entries[perm_slot].index == perm_index_val
                                         && perm_chunk.entries[perm_slot].active
                                     {
-                                        set_bit(&mut result, perm_index);
+                                        set_bit(&mut result, perm_index_val);
                                     }
                                     // inactive or not in entries → bit silently dropped
                                 }
                                 // chunk not in accounts → treat permission as inactive, drop bit
                             } else {
-                                set_bit(&mut result, perm_index);
+                                set_bit(&mut result, perm_index_val);
                             }
                         }
                     }

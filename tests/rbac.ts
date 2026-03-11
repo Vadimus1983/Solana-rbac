@@ -2225,7 +2225,7 @@ describe("rbac", () => {
   // that includes an already-processed user is rejected atomically, keeping
   // `users_pending_recompute` accurate.
   // ---------------------------------------------------------------------------
-  it("Bug1 fix: processRecomputeBatch rejects a user already processed in a prior batch call with AlreadyRecomputed", async () => {
+  it("processRecomputeBatch rejects a user already processed in a prior batch call with AlreadyRecomputed", async () => {
     // Enter Recomputing state.
     await program.methods
       .beginUpdate()
@@ -2331,7 +2331,7 @@ describe("rbac", () => {
   // (b) the error code used for the guard is MemberCountOverflow, confirming
   // the guard is wired to the same error that commit_update raises.
   // ---------------------------------------------------------------------------
-  it("Bug2 fix: member_count increments per user and overflow guard uses MemberCountOverflow", async () => {
+  it("member_count increments per user and overflow guard uses MemberCountOverflow", async () => {
     // Snapshot member_count before creating a fresh user.
     const orgBefore = await program.account.organization.fetch(orgPda);
     const countBefore = (orgBefore.memberCount as anchor.BN).toNumber();
@@ -2426,7 +2426,7 @@ describe("rbac", () => {
   // that the new VersionOverflow error code is wired into the program (if the
   // code ever compiles successfully, the checked_add path exists).
   // ---------------------------------------------------------------------------
-  it("Bug3 fix: permissions_version increments by exactly 1 on each commitUpdate", async () => {
+  it("permissions_version increments by exactly 1 on each commitUpdate", async () => {
     const orgBefore = await program.account.organization.fetch(orgPda);
     const versionBefore = (orgBefore.permissionsVersion as anchor.BN).toNumber();
 

@@ -125,6 +125,13 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
     let pcc = perm_chunk_count as usize;
     let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
 
+    // Index perm chunks once for O(1) lookups.
+    let perm_index = if pcc > 0 {
+        Some(build_perm_chunk_index(perm_accounts, &org_key, ctx.program_id)?)
+    } else {
+        None
+    };
+
     // Read role entry data (clone to avoid borrow conflicts with user_account).
     let slot = role_index as usize % ROLES_PER_CHUNK;
     let chunk = &ctx.accounts.role_chunk;
@@ -141,23 +148,22 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
     let entry_effective: Vec<u8> = if pcc > 0 {
         let mut filtered = Vec::new();
         for (byte_idx, &byte) in raw_effective.iter().enumerate() {
-            if byte == 0 { continue; }
+            if byte == 0 {
+                continue;
+            }
             for bit in 0..8u32 {
                 if byte & (1 << bit) != 0 {
-                    let perm_index = (byte_idx as u32) * 8 + bit;
-                    let perm_chunk_idx = perm_index / PERMS_PER_CHUNK as u32;
-                    let perm_slot = perm_index as usize % PERMS_PER_CHUNK;
-                    if let Ok(perm_chunk) = find_perm_chunk_in_accounts(
-                        perm_accounts,
-                        &org_key,
-                        perm_chunk_idx,
-                        ctx.program_id,
-                    ) {
+                    let perm_index_val = (byte_idx as u32) * 8 + bit;
+                    let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
+                    let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
+                    if let Some(perm_chunk) =
+                        perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
+                    {
                         if perm_slot < perm_chunk.entries.len()
-                            && perm_chunk.entries[perm_slot].index == perm_index
+                            && perm_chunk.entries[perm_slot].index == perm_index_val
                             && perm_chunk.entries[perm_slot].active
                         {
-                            set_bit(&mut filtered, perm_index);
+                            set_bit(&mut filtered, perm_index_val);
                         }
                     }
                 }
