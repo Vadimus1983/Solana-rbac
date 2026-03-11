@@ -452,8 +452,9 @@ describe("rbac", () => {
 
   it("Step 9: Batch recompute (users have no roles yet — 0 chunks each)", async () => {
     // Both users have no roles assigned yet, so 0 chunk accounts each.
-    // Layout: [UA, UPC] per user (no chunks). perm_chunk_count=0 (no direct perms either).
+    // Layout: [permChunk0], [UA, UPC] per user (no role chunks). perm_chunk_count=1 required when org has permissions.
     const remainingAccounts = [
+      { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
       { pubkey: bobUaPda, isWritable: true, isSigner: false },
       { pubkey: bobUpcPda, isWritable: true, isSigner: false },
       { pubkey: carolUaPda, isWritable: true, isSigner: false },
@@ -461,7 +462,7 @@ describe("rbac", () => {
     ];
 
     await program.methods
-      .processRecomputeBatch(Buffer.from([0, 0]), 0)
+      .processRecomputeBatch(Buffer.from([0, 0]), 1)
       .accounts({
         organization: orgPda,
         authority: alice.publicKey,
@@ -605,10 +606,10 @@ describe("rbac", () => {
   // Step 13 — Revoke Bob's editor role in Idle state (no batch recompute needed)
   // -------------------------------------------------------------------------
   it("Step 13: Alice revokes Bob's editor role (Idle state)", async () => {
-    // Bob has no remaining roles after revocation and no direct permissions, so
-    // perm_chunk_count=0 and no chunk accounts needed.
+    // Bob has no remaining roles after revocation and no direct permissions.
+    // perm_chunk_count=1 required when org has permissions; no role chunks needed.
     await program.methods
-      .revokeRole(editorRoleIdx, 0)
+      .revokeRole(editorRoleIdx, 1)
       .accounts({
         userAccount: bobUaPda,
         userPermCache: bobUpcPda,
@@ -616,7 +617,7 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([])  // no remaining roles, no perm chunks → no chunks needed
+      .remainingAccounts([{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }])
       .rpc();
 
     const ua = await program.account.userAccount.fetch(bobUaPda);
@@ -719,16 +720,16 @@ describe("rbac", () => {
     assert.equal(org.permissionsVersion.toNumber(), 2);
 
     // Carol has viewer role (chunk 0). Bob has no roles.
-    // perm_chunk_count=0: all active perms are included as-is (no inactive perms exist here).
-    // Layout: [UA, UPC] for Bob (0 chunks), [UA, UPC, roleChunk0] for Carol (1 chunk).
+    // Layout: [permChunk0], [UA, UPC] for Bob (0 role chunks), [UA, UPC, roleChunk0] for Carol (1 chunk).
     await program.methods
-      .processRecomputeBatch(Buffer.from([0, 1]), 0)
+      .processRecomputeBatch(Buffer.from([0, 1]), 1)
       .accounts({
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda, isWritable: true, isSigner: false },
         { pubkey: bobUpcPda, isWritable: true, isSigner: false },
         { pubkey: carolUaPda, isWritable: true, isSigner: false },
@@ -854,7 +855,7 @@ describe("rbac", () => {
     );
 
     if (staleUAs.length > 0) {
-      const remainingAccts: any[] = [];
+      const remainingAccts: any[] = [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }];
       const counts: number[] = [];
       for (const ua of staleUAs) {
         const assignedRoles = ua.account.assignedRoles as { topoIndex: number }[];
@@ -869,9 +870,8 @@ describe("rbac", () => {
         remainingAccts.push({ pubkey: upcPda, isWritable: true, isSigner: false });
         for (const c of userChunks) remainingAccts.push(c);
       }
-      // perm_chunk_count=0: no inactive perms were introduced in this cycle.
       await program.methods
-        .processRecomputeBatch(Buffer.from(counts), 0)
+        .processRecomputeBatch(Buffer.from(counts), 1)
         .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
         .remainingAccounts(remainingAccts)
         .rpc();
@@ -984,9 +984,10 @@ describe("rbac", () => {
 
     // Process all members (carol, no roles → 0 chunks) so users_pending_recompute reaches 0.
     await program.methods
-      .processRecomputeBatch(Buffer.from([0]), 0)
+      .processRecomputeBatch(Buffer.from([0]), 1)
       .accounts({ organization: attackOrgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: attackPermChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: carolUaAttackOrgPda,  isWritable: true, isSigner: false },
         { pubkey: carolUpcAttackOrgPda, isWritable: true, isSigner: false },
       ])
@@ -1098,7 +1099,7 @@ describe("rbac", () => {
     // carol tries to revoke dave's viewer role using her attack_org cache.
     try {
       await program.methods
-        .revokeRole(viewerRoleIdx, 0)  // pcc=0: no perm chunks (will fail at auth check first)
+        .revokeRole(viewerRoleIdx, 1)
         .accounts({
           userAccount: daveUaPda,
           userPermCache: daveUpcPda,
@@ -1107,8 +1108,9 @@ describe("rbac", () => {
           systemProgram: SystemProgram.programId,
         })
         .remainingAccounts([
-          // Attack: cross-org cache as delegation proof, then role chunks would follow
+          // Attack: cross-org cache as delegation proof; permChunk0 for acme_corp to pass PermChunksRequired
           { pubkey: carolUpcAttackOrgPda, isWritable: false, isSigner: false },
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         ])
         .signers([carol])
         .rpc();
@@ -1158,11 +1160,11 @@ describe("rbac", () => {
       .rpc();
 
     // Process ALL members (Bob=editor/chunk0, Carol=viewer/chunk0, Dave=viewer/chunk0).
-    // pcc=0: no permissions were deleted this cycle so no filtering needed.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda,  isWritable: false, isSigner: false },
         { pubkey: bobUaPda,       isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,      isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
@@ -1201,17 +1203,16 @@ describe("rbac", () => {
     );
 
     // Clean up: revoke dave's viewer role so we can re-assign it via delegation.
-    // dave has no direct permissions at this point → pcc=0.
     await program.methods
-      .revokeRole(viewerRoleIdx, 0)
+      .revokeRole(viewerRoleIdx, 1)
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
         organization: orgPda,
-        authority: alice.publicKey,   // alice as super_admin, no remaining_accounts needed
+        authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([])  // dave has no remaining roles after viewer is revoked
+      .remainingAccounts([{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }])
       .rpc();
 
     // Now carol (delegated) assigns the viewer role to dave using her acme_corp cache.
@@ -1275,7 +1276,7 @@ describe("rbac", () => {
   let tempPermIdx: number; // will be 4 (nextPermissionIndex after delegation tests)
 
   it("stale-bit setup: create temp_perm, assign to dave, soft-delete it", async () => {
-    // Phase 1: create temp_perm (next index in acme_corp after the issue #1 cycle).
+    // Phase 1: create temp_perm (next index in acme_corp after the chunk-index cycle).
     await program.methods
       .beginUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
@@ -1299,12 +1300,12 @@ describe("rbac", () => {
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
 
-    // Process all 3 members (Bob, Carol, Dave) — pcc=0, no filtering needed.
-    // Each has 1 role chunk (roleChunk0). users_pending_recompute must reach 0.
+    // Process all 3 members (Bob, Carol, Dave). Each has 1 role chunk (roleChunk0).
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -1560,7 +1561,7 @@ describe("rbac", () => {
   // Helper: process all three acme_corp members (Bob/Carol/Dave, each in chunk 0)
   // and finish the update cycle. Used by the issue-fix integration tests below.
   // ---------------------------------------------------------------------------
-  async function completeRecomputeCycle(pcc: number = 0): Promise<void> {
+  async function completeRecomputeCycle(pcc: number = 1): Promise<void> {
     const extraAccounts: anchor.web3.AccountMeta[] = [];
     if (pcc > 0) {
       extraAccounts.push({ pubkey: permChunk0Pda, isWritable: false, isSigner: false });
@@ -1644,7 +1645,7 @@ describe("rbac", () => {
       .commitUpdate()
       .accounts({ organization: orgPda, authority: alice.publicKey })
       .rpc();
-    await completeRecomputeCycle(0);
+    await completeRecomputeCycle(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -1677,7 +1678,7 @@ describe("rbac", () => {
     }
 
     // Process all users and finish cleanly.
-    await completeRecomputeCycle(0);
+    await completeRecomputeCycle(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -1723,7 +1724,7 @@ describe("rbac", () => {
     }
 
     // Bring all caches up to date, then verify both instructions succeed.
-    await completeRecomputeCycle(0);
+    await completeRecomputeCycle(1);
 
     await program.methods
       .hasPermission(readPermIdx)
@@ -1763,13 +1764,14 @@ describe("rbac", () => {
     // Submit Bob's UA twice in the same batch — must be rejected.
     try {
       await program.methods
-        .processRecomputeBatch(Buffer.from([1, 1]), 0)
+        .processRecomputeBatch(Buffer.from([1, 1]), 1)
         .accounts({
           organization: orgPda,
           authority: alice.publicKey,
           systemProgram: SystemProgram.programId,
         })
         .remainingAccounts([
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
           { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
           { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
           { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -1790,7 +1792,7 @@ describe("rbac", () => {
     }
 
     // Org is still Recomputing — complete it cleanly before the next test.
-    await completeRecomputeCycle(0);
+    await completeRecomputeCycle(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -1900,9 +1902,10 @@ describe("rbac", () => {
     // viewer still in their UA.assigned_roles (chunk 0 provided so entry can be
     // read and checked for active status).
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2096,9 +2099,10 @@ describe("rbac", () => {
     // Process all 3 members. Bob has editor (chunk 0); Carol and Dave still
     // have the deleted viewer (chunk 0) in their assigned_roles.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2245,9 +2249,10 @@ describe("rbac", () => {
 
     // Batch 1: process only Bob.  After this his cached_version == target_version.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1]), 0)
+      .processRecomputeBatch(Buffer.from([1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2264,9 +2269,10 @@ describe("rbac", () => {
     // Batch 2: submit Bob again — must be rejected with AlreadyRecomputed.
     try {
       await program.methods
-        .processRecomputeBatch(Buffer.from([1]), 0)
+        .processRecomputeBatch(Buffer.from([1]), 1)
         .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
         .remainingAccounts([
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
           { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
           { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
           { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2292,9 +2298,10 @@ describe("rbac", () => {
 
     // Process the remaining two users and close the cycle cleanly.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: carolUaPda,    isWritable: true,  isSigner: false },
         { pubkey: carolUpcPda,   isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2312,6 +2319,71 @@ describe("rbac", () => {
     const orgFinal = await program.account.organization.fetch(orgPda);
     assert.equal(orgFinal.usersPendingRecompute as number, 0, "counter must reach 0 after all users processed");
     assert.deepEqual(orgFinal.state, { idle: {} }, "org must be Idle after finishUpdate");
+  });
+
+  // ---------------------------------------------------------------------------
+  // processRecomputeBatch requires PermChunks when org has permissions so that
+  // soft-deleted permission bits are filtered out.
+  // ---------------------------------------------------------------------------
+  it("processRecomputeBatch with perm_chunk_count 0 when org has permissions is rejected with PermChunksRequired", async () => {
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+    await recomputeAllRoles(orgPda);
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    try {
+      await program.methods
+        .processRecomputeBatch(Buffer.from([0]), 0)
+        .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts([
+          { pubkey: bobUaPda, isWritable: true, isSigner: false },
+          { pubkey: bobUpcPda, isWritable: true, isSigner: false },
+        ])
+        .rpc();
+      assert.fail("expected PermChunksRequired");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "PermChunksRequired",
+        `Expected PermChunksRequired, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    await completeRecomputeCycle(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // revoke_role requires PermChunks when org has permissions so that
+  // soft-deleted permission bits are filtered out.
+  // ---------------------------------------------------------------------------
+  it("revokeRole with perm_chunk_count 0 when org has permissions is rejected with PermChunksRequired", async () => {
+    try {
+      await program.methods
+        .revokeRole(editorRoleIdx, 0)
+        .accounts({
+          userAccount: bobUaPda,
+          userPermCache: bobUpcPda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([])
+        .rpc();
+      assert.fail("expected PermChunksRequired");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "PermChunksRequired",
+        `Expected PermChunksRequired, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -2388,9 +2460,10 @@ describe("rbac", () => {
     // Process all 4 members (Bob, Carol, Dave, Eve).
     // Eve has no roles → user_chunk_counts[Eve] = 0.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1, 0]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1, 0]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda,   isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,  isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2457,9 +2530,10 @@ describe("rbac", () => {
     // Eve was created in the Bug2 test; her Keypair is out of scope here,
     // so she is handled by the dynamic stale-UA loop below.
     await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1]), 0)
+      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
       .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
       .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         { pubkey: bobUaPda,      isWritable: true,  isSigner: false },
         { pubkey: bobUpcPda,     isWritable: true,  isSigner: false },
         { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
@@ -2482,7 +2556,7 @@ describe("rbac", () => {
     );
 
     if (staleUAs.length > 0) {
-      const remainingAccts: any[] = [];
+      const remainingAccts: any[] = [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }];
       const counts: number[] = [];
       for (const ua of staleUAs) {
         const assignedRoles = ua.account.assignedRoles as { topoIndex: number }[];
@@ -2498,7 +2572,7 @@ describe("rbac", () => {
         for (const c of userChunks) remainingAccts.push(c);
       }
       await program.methods
-        .processRecomputeBatch(Buffer.from(counts), 0)
+        .processRecomputeBatch(Buffer.from(counts), 1)
         .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
         .remainingAccounts(remainingAccts)
         .rpc();

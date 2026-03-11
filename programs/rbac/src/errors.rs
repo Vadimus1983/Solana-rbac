@@ -103,4 +103,9 @@ pub enum RbacError {
     /// permissions_version wrapped around u64::MAX.
     #[msg("Permissions version overflow")]
     VersionOverflow,
+
+    /// When the organization has any permissions, PermChunk accounts must be
+    /// supplied so that soft-deleted permission bits can be filtered out.
+    #[msg("PermChunk accounts required when organization has permissions")]
+    PermChunksRequired,
 }

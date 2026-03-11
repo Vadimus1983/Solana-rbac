@@ -43,7 +43,15 @@ pub fn handler(
         require!(org.state == OrgState::Recomputing, RbacError::OrgNotRecomputing);
     }
 
-    let target_version = ctx.accounts.organization.permissions_version;
+    let org = &ctx.accounts.organization;
+    // Require PermChunks when org has permissions so deleted permission bits are filtered out.
+    let pcc = perm_chunk_count as usize;
+    require!(
+        org.next_permission_index == 0 || pcc > 0,
+        RbacError::PermChunksRequired
+    );
+
+    let target_version = org.permissions_version;
     let org_key = ctx.accounts.organization.key();
 
     let authority_info = ctx.accounts.authority.to_account_info();
@@ -52,7 +60,6 @@ pub fn handler(
     // the loop without mixing lifetimes from ctx.accounts and remaining_accounts.
     let org_account_info = ctx.accounts.organization.to_account_info();
 
-    let pcc = perm_chunk_count as usize;
     let perm_accounts = &ctx.remaining_accounts[..pcc];
     let remaining = &ctx.remaining_accounts[pcc..];
     let mut offset: usize = 0;

@@ -63,6 +63,13 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
 
+    let pcc = perm_chunk_count as usize;
+    // Require PermChunks when org has permissions so deleted permission bits are filtered out.
+    require!(
+        org.next_permission_index == 0 || pcc > 0,
+        RbacError::PermChunksRequired
+    );
+
     let org_key = org.key();
     let org_permissions_version = org.permissions_version;
 
@@ -112,7 +119,6 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         base_offset = 0;
     }
 
-    let pcc = perm_chunk_count as usize;
     let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
     let role_chunks = &ctx.remaining_accounts[base_offset + pcc..];
 
