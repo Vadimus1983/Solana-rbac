@@ -21,7 +21,7 @@ pub struct CreateResource<'info> {
     pub resource: Account<'info, Resource>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
     )]
     pub organization: Account<'info, Organization>,
@@ -58,6 +58,7 @@ pub fn handler(
     let cache = &ctx.accounts.user_perm_cache;
     let org = &ctx.accounts.organization;
 
+    require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
     require!(
         cache.permissions_version >= org.permissions_version,
         RbacError::StalePermissions

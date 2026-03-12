@@ -9,7 +9,7 @@ use crate::state::*;
 pub struct DeleteResource<'info> {
     #[account(
         mut,
-        close = authority,
+        close = resource_creator,
         seeds = [
             b"resource",
             organization.key().as_ref(),
@@ -21,7 +21,7 @@ pub struct DeleteResource<'info> {
     pub resource: Account<'info, Resource>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
     )]
     pub organization: Account<'info, Organization>,
@@ -40,12 +40,21 @@ pub struct DeleteResource<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    /// Receives the rent lamports when the resource is closed.
+    /// Must match the pubkey stored in resource.creator.
+    #[account(
+        mut,
+        constraint = resource_creator.key() == resource.creator @ RbacError::NotResourceCreator,
+    )]
+    pub resource_creator: SystemAccount<'info>,
 }
 
 pub fn handler(ctx: Context<DeleteResource>, required_permission: u32) -> Result<()> {
     let cache = &ctx.accounts.user_perm_cache;
     let org = &ctx.accounts.organization;
 
+    require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
     require!(
         cache.permissions_version >= org.permissions_version,
         RbacError::StalePermissions

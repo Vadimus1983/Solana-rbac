@@ -5,8 +5,6 @@ use crate::errors::RbacError;
 
 pub const MAX_ORG_NAME_LEN: usize = 32;
 
-/// Well-known permission index that grants the ability to assign/revoke roles.
-pub const MANAGE_ROLES_PERMISSION_INDEX: u32 = 3;
 pub const MAX_ROLE_NAME_LEN: usize = 32;
 pub const MAX_ROLE_DESC_LEN: usize = 128;
 pub const MAX_PERMISSION_NAME_LEN: usize = 32;
@@ -111,7 +109,12 @@ pub struct RoleRef {
 
 #[account]
 pub struct Organization {
+    /// The current authority who can administer this organization.
+    /// Changed by transfer_super_admin; used only for authorization checks.
     pub super_admin: Pubkey,
+    /// The pubkey of the original creator — stored immutably and used in PDA
+    /// seeds so the org address is stable across super_admin transfers.
+    pub original_admin: Pubkey,
     pub name: String,
     pub member_count: u64,
     pub next_permission_index: u32,
@@ -128,21 +131,26 @@ pub struct Organization {
     /// Set to member_count by commit_update, decremented by
     /// process_recompute_batch. finish_update requires this to be 0.
     pub users_pending_recompute: u32,
+    /// Permission index that grants the ability to assign/revoke roles on behalf
+    /// of the super_admin. Set at org creation; configurable per-organization.
+    pub manage_roles_permission: u32,
 }
 
 impl Organization {
     pub const FIXED_SIZE: usize = 8  // discriminator
         + 32                          // super_admin
+        + 32                          // original_admin
         + (4 + MAX_ORG_NAME_LEN)     // name
         + 8                           // member_count
         + 4                           // next_permission_index
         + 4                           // role_count
-        + 4                           // active_role_count  (new)
+        + 4                           // active_role_count
         + 8                           // permissions_version
         + 1 + 0                       // OrgState enum (1-byte tag, no data)
         + 1                           // bump
-        + 4                           // roles_pending_recompute  (new)
-        + 4;                          // users_pending_recompute  (new)
+        + 4                           // roles_pending_recompute
+        + 4                           // users_pending_recompute
+        + 4;                          // manage_roles_permission
 }
 
 /// Holds up to ROLES_PER_CHUNK role entries. PDA: ["role_chunk", org, chunk_index_le4].

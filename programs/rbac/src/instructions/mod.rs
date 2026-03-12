@@ -23,6 +23,7 @@ pub mod has_permission;
 pub mod has_role;
 pub mod create_resource;
 pub mod delete_resource;
+pub mod transfer_super_admin;
 
 pub use initialize_org::*;
 pub use begin_update::*;
@@ -47,3 +48,4 @@ pub use has_permission::*;
 pub use has_role::*;
 pub use create_resource::*;
 pub use delete_resource::*;
+pub use transfer_super_admin::*;

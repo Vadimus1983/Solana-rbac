@@ -7,7 +7,7 @@ use crate::state::*;
 pub struct FinishUpdate<'info> {
     #[account(
         mut,
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
     )]

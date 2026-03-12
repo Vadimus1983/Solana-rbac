@@ -19,7 +19,7 @@ pub struct DeletePermission<'info> {
     pub perm_chunk: Account<'info, PermChunk>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
     )]

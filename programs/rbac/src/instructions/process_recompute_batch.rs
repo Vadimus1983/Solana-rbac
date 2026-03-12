@@ -18,7 +18,7 @@ use crate::state::*;
 pub struct ProcessRecomputeBatch<'info> {
     #[account(
         mut,
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
     )]
@@ -178,7 +178,9 @@ pub fn handler(
             let chunk = role_index
                 .get(&chunk_idx)
                 .ok_or(RbacError::ChunkNotFound)?;
+            require!(slot < chunk.entries.len(), RbacError::RoleSlotEmpty);
             let entry = &chunk.entries[slot];
+            require!(entry.topo_index == role_ref.topo_index, RbacError::RoleSlotEmpty);
             if entry.active {
                 active_role_indices.push(role_ref.topo_index);
                 // Filter the role's effective_permissions through PermChunk active status,
@@ -306,9 +308,13 @@ pub fn handler(
 
     // Decrement the user recompute counter by the number of users processed
     // in this batch so finish_update can enforce completeness.
-    let users_processed = user_chunk_counts.len() as u32;
+    let users_processed = u32::try_from(user_chunk_counts.len())
+        .map_err(|_| error!(RbacError::AccountCountMismatch))?;
     let org = &mut ctx.accounts.organization;
-    org.users_pending_recompute = org.users_pending_recompute.saturating_sub(users_processed);
+    org.users_pending_recompute = org
+        .users_pending_recompute
+        .checked_sub(users_processed)
+        .ok_or(error!(RbacError::UpdateIncomplete))?;
 
     Ok(())
 }

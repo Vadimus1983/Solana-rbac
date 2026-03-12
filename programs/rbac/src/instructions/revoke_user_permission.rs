@@ -42,7 +42,7 @@ pub struct RevokeUserPermission<'info> {
     pub user_perm_cache: Account<'info, UserPermCache>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
     )]
@@ -60,14 +60,16 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32, perm_c
     let org_permissions_version = org.permissions_version;
     let next_permission_index = org.next_permission_index;
 
+    let pcc = perm_chunk_count as usize;
+    require!(
+        org.next_permission_index == 0 || pcc > 0,
+        RbacError::PermChunksRequired
+    );
+
     let ua = &mut ctx.accounts.user_account;
-    // Reject out-of-range permission indices.
     require!(permission_index < next_permission_index, RbacError::InvalidPermissionIndex);
-    // Reject no-op revocations — the user must actually hold this direct permission.
     require!(has_bit(&ua.direct_permissions, permission_index), RbacError::PermissionNotAssigned);
     clear_bit(&mut ua.direct_permissions, permission_index);
-
-    let pcc = perm_chunk_count as usize;
     let perm_accounts = &ctx.remaining_accounts[..pcc];
     let role_accounts = &ctx.remaining_accounts[pcc..];
 
@@ -125,7 +127,9 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32, perm_c
         let chunk = role_chunk_index
             .get(&chunk_idx)
             .ok_or(RbacError::ChunkNotFound)?;
+        require!(slot < chunk.entries.len(), RbacError::RoleSlotEmpty);
         let entry = &chunk.entries[slot];
+        require!(entry.topo_index == role_ref.topo_index, RbacError::RoleSlotEmpty);
         if entry.active {
             for (byte_idx, &byte) in entry.effective_permissions.iter().enumerate() {
                 if byte == 0 {

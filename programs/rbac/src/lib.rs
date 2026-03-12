@@ -29,8 +29,9 @@ pub mod rbac {
     pub fn initialize_organization(
         ctx: Context<InitializeOrganization>,
         name: String,
+        manage_roles_permission: u32,
     ) -> Result<()> {
-        instructions::initialize_org::handler(ctx, name)
+        instructions::initialize_org::handler(ctx, name, manage_roles_permission)
     }
 
     // ── State machine ───────────────────────────────────────────────────
@@ -179,5 +180,9 @@ pub mod rbac {
         required_permission: u32,
     ) -> Result<()> {
         instructions::delete_resource::handler(ctx, required_permission)
+    }
+
+    pub fn transfer_super_admin(ctx: Context<TransferSuperAdmin>) -> Result<()> {
+        instructions::transfer_super_admin::handler(ctx)
     }
 }

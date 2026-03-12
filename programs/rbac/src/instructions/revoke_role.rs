@@ -41,7 +41,7 @@ pub struct RevokeRole<'info> {
     pub user_perm_cache: Account<'info, UserPermCache>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
     )]
     pub organization: Account<'info, Organization>,
@@ -111,7 +111,7 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
             RbacError::StalePermissions
         );
         require!(
-            has_bit(&caller_cache.effective_permissions, MANAGE_ROLES_PERMISSION_INDEX),
+            has_bit(&caller_cache.effective_permissions, org.manage_roles_permission),
             RbacError::InsufficientPermission
         );
         base_offset = 1;
@@ -119,6 +119,10 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         base_offset = 0;
     }
 
+    require!(
+        base_offset + pcc <= ctx.remaining_accounts.len(),
+        RbacError::AccountCountMismatch
+    );
     let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
     let role_chunks = &ctx.remaining_accounts[base_offset + pcc..];
 
@@ -182,7 +186,9 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         let chunk = role_chunk_index
             .get(&chunk_idx)
             .ok_or(RbacError::ChunkNotFound)?;
+        require!(slot < chunk.entries.len(), RbacError::RoleSlotEmpty);
         let entry = &chunk.entries[slot];
+        require!(entry.topo_index == role_ref.topo_index, RbacError::RoleSlotEmpty);
         if entry.active {
             for (byte_idx, &byte) in entry.effective_permissions.iter().enumerate() {
                 if byte == 0 {

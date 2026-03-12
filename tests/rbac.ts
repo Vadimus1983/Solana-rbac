@@ -20,9 +20,9 @@ const PERMS_PER_CHUNK = 32;
 // PDA helpers
 // ---------------------------------------------------------------------------
 
-function findOrgPda(programId: PublicKey, name: string): [PublicKey, number] {
+function findOrgPda(programId: PublicKey, admin: PublicKey, name: string): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from("organization"), Buffer.from(name)],
+    [Buffer.from("organization"), admin.toBuffer(), Buffer.from(name)],
     programId
   );
 }
@@ -202,10 +202,10 @@ describe("rbac", () => {
   // Step 1 — Alice creates organisation (starts in Idle)
   // -------------------------------------------------------------------------
   it("Step 1: Alice creates organisation 'acme_corp'", async () => {
-    [orgPda] = findOrgPda(program.programId, orgName);
+    [orgPda] = findOrgPda(program.programId, alice.publicKey, orgName);
 
     await program.methods
-      .initializeOrganization(orgName)
+      .initializeOrganization(orgName, 3)
       .accounts({
         organization: orgPda,
         authority: alice.publicKey,
@@ -946,13 +946,13 @@ describe("rbac", () => {
   });
 
   it("Security setup: create attack_org and carol's user account in it", async () => {
-    [attackOrgPda] = findOrgPda(program.programId, attackOrgName);
+    [attackOrgPda] = findOrgPda(program.programId, alice.publicKey, attackOrgName);
     [carolUaAttackOrgPda] = findUserAccountPda(program.programId, attackOrgPda, carol.publicKey);
     [carolUpcAttackOrgPda] = findUserPermCachePda(program.programId, attackOrgPda, carol.publicKey);
 
     // Alice creates attack_org (she's the super_admin; carol will be a member).
     await program.methods
-      .initializeOrganization(attackOrgName)
+      .initializeOrganization(attackOrgName, 3)
       .accounts({
         organization: attackOrgPda,
         authority: alice.publicKey,
@@ -2970,6 +2970,376 @@ describe("rbac", () => {
     }
 
     // Clean up: recompute all roles and complete the cycle.
+    await fullRecomputeCycle();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix H-1: revokeUserPermission requires PermChunks when org has permissions.
+  // Calling with pcc=0 when next_permission_index > 0 must fail PermChunksRequired.
+  // ---------------------------------------------------------------------------
+  it("revokeUserPermission with pcc=0 when org has permissions is rejected with PermChunksRequired", async () => {
+    // Give Bob a direct write permission so there is something to revoke.
+    await program.methods
+      .assignUserPermission(writePermIdx)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        permChunk: permChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Calling with pcc=0 must be rejected because org has permissions (next_permission_index > 0).
+    try {
+      await program.methods
+        .revokeUserPermission(writePermIdx, 0)
+        .accounts({
+          userAccount: bobUaPda,
+          userPermCache: bobUpcPda,
+          organization: orgPda,
+          authority: alice.publicKey,
+        })
+        .remainingAccounts([])
+        .rpc();
+      assert.fail("expected PermChunksRequired");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "PermChunksRequired"
+      );
+    }
+
+    // Clean up: revoke correctly with pcc=1.
+    await program.methods
+      .revokeUserPermission(writePermIdx, 1)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix H-2: remaining_accounts slice bounds validated before indexing.
+  // Passing pcc > remaining_accounts.len() must fail with AccountCountMismatch.
+  // ---------------------------------------------------------------------------
+  it("assignRole with pcc exceeding remaining_accounts length is rejected with AccountCountMismatch", async () => {
+    try {
+      // perm_chunk_count=5 but zero remaining_accounts provided — triggers bounds check.
+      await program.methods
+        .assignRole(editorRoleIdx, 5)
+        .accounts({
+          userAccount: carolUaPda,
+          userPermCache: carolUpcPda,
+          roleChunk: roleChunk0Pda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([])
+        .rpc();
+      assert.fail("expected AccountCountMismatch");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "AccountCountMismatch"
+      );
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix M-1: org PDA seeds include the creator pubkey so different admins can
+  // create orgs with the same name without collision.
+  // ---------------------------------------------------------------------------
+  it("two admins can create orgs with the same name without PDA collision", async () => {
+    const otherAdmin = Keypair.generate();
+    const fundSig = await provider.connection.requestAirdrop(otherAdmin.publicKey, LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(fundSig);
+
+    const sharedName = "shared_org_test";
+    const [aliceSharedOrgPda] = findOrgPda(program.programId, alice.publicKey, sharedName);
+    const [otherSharedOrgPda] = findOrgPda(program.programId, otherAdmin.publicKey, sharedName);
+
+    assert.notEqual(
+      aliceSharedOrgPda.toBase58(),
+      otherSharedOrgPda.toBase58(),
+      "same org name with different admins must produce distinct PDAs"
+    );
+
+    await program.methods
+      .initializeOrganization(sharedName, 0)
+      .accounts({
+        organization: aliceSharedOrgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    await program.methods
+      .initializeOrganization(sharedName, 0)
+      .accounts({
+        organization: otherSharedOrgPda,
+        authority: otherAdmin.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([otherAdmin])
+      .rpc();
+
+    const aliceOrg = await program.account.organization.fetch(aliceSharedOrgPda);
+    const otherOrg = await program.account.organization.fetch(otherSharedOrgPda);
+    assert.ok(aliceOrg.superAdmin.equals(alice.publicKey));
+    assert.ok(otherOrg.superAdmin.equals(otherAdmin.publicKey));
+    assert.ok((aliceOrg as any).originalAdmin.equals(alice.publicKey));
+    assert.ok((otherOrg as any).originalAdmin.equals(otherAdmin.publicKey));
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix M-2: deleteResource closes the account to resource.creator, not authority.
+  // Passing a wrong resource_creator account must fail with NotResourceCreator.
+  // ---------------------------------------------------------------------------
+  it("deleteResource rejects wrong resource_creator and closes to the correct creator", async () => {
+    // Grant Bob write permission so he can create/delete resources.
+    await program.methods
+      .assignUserPermission(writePermIdx)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        permChunk: permChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const resourceId = new anchor.BN(80001);
+    const [resourcePda] = findResourcePda(program.programId, orgPda, resourceId);
+
+    await program.methods
+      .createResource("creator_test", resourceId, writePermIdx)
+      .accounts({
+        resource: resourcePda,
+        organization: orgPda,
+        userPermCache: bobUpcPda,
+        authority: bob.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([bob])
+      .rpc();
+
+    const res = await program.account.resource.fetch(resourcePda);
+    assert.ok(res.creator.equals(bob.publicKey), "resource.creator must be Bob");
+
+    // Attempt to delete while passing Carol (not the creator) as resource_creator.
+    try {
+      await program.methods
+        .deleteResource(writePermIdx)
+        .accounts({
+          resource: resourcePda,
+          organization: orgPda,
+          userPermCache: bobUpcPda,
+          authority: bob.publicKey,
+          resourceCreator: carol.publicKey,
+        })
+        .signers([bob])
+        .rpc();
+      assert.fail("expected NotResourceCreator");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "NotResourceCreator"
+      );
+    }
+
+    // Correct deletion: resource_creator == resource.creator (Bob).
+    await program.methods
+      .deleteResource(writePermIdx)
+      .accounts({
+        resource: resourcePda,
+        organization: orgPda,
+        userPermCache: bobUpcPda,
+        authority: bob.publicKey,
+        resourceCreator: bob.publicKey,
+      })
+      .signers([bob])
+      .rpc();
+
+    // Resource account must be closed.
+    const closed = await provider.connection.getAccountInfo(resourcePda);
+    assert.isNull(closed, "resource account must be closed after deleteResource");
+
+    // Clean up: revoke write perm from Bob.
+    await program.methods
+      .revokeUserPermission(writePermIdx, 1)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: roleChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix L-1: transferSuperAdmin changes authority while keeping org PDA stable.
+  // The originalAdmin field is set at init and never changes.
+  // ---------------------------------------------------------------------------
+  it("transferSuperAdmin changes authority, old admin is rejected, and transfer back restores access", async () => {
+    const orgBefore = await program.account.organization.fetch(orgPda);
+    assert.ok(orgBefore.superAdmin.equals(alice.publicKey));
+    assert.ok((orgBefore as any).originalAdmin.equals(alice.publicKey));
+
+    // Transfer to Bob.
+    await program.methods
+      .transferSuperAdmin()
+      .accounts({
+        organization: orgPda,
+        newSuperAdmin: bob.publicKey,
+        authority: alice.publicKey,
+      })
+      .rpc();
+
+    const orgAfter = await program.account.organization.fetch(orgPda);
+    assert.ok(orgAfter.superAdmin.equals(bob.publicKey), "superAdmin must be Bob after transfer");
+    assert.ok((orgAfter as any).originalAdmin.equals(alice.publicKey), "originalAdmin must remain Alice");
+
+    // Alice (old admin) must be rejected for super_admin-gated ops.
+    try {
+      await program.methods
+        .beginUpdate()
+        .accounts({ organization: orgPda, authority: alice.publicKey })
+        .rpc();
+      assert.fail("expected NotSuperAdmin for Alice");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "NotSuperAdmin");
+    }
+
+    // Passing the same pubkey as new_super_admin must fail with AlreadySuperAdmin.
+    try {
+      await program.methods
+        .transferSuperAdmin()
+        .accounts({
+          organization: orgPda,
+          newSuperAdmin: bob.publicKey,
+          authority: bob.publicKey,
+        })
+        .signers([bob])
+        .rpc();
+      assert.fail("expected AlreadySuperAdmin");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "AlreadySuperAdmin");
+    }
+
+    // Transfer back to Alice (org is still Idle — no update cycle started).
+    await program.methods
+      .transferSuperAdmin()
+      .accounts({
+        organization: orgPda,
+        newSuperAdmin: alice.publicKey,
+        authority: bob.publicKey,
+      })
+      .signers([bob])
+      .rpc();
+
+    const orgRestored = await program.account.organization.fetch(orgPda);
+    assert.ok(orgRestored.superAdmin.equals(alice.publicKey), "superAdmin must be Alice again");
+    assert.ok((orgRestored as any).originalAdmin.equals(alice.publicKey));
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix L-2: manage_roles_permission is stored per-org and read at delegation time
+  // instead of using a hardcoded constant.
+  // ---------------------------------------------------------------------------
+  it("organization.manageRolesPermission reflects the value set at initialization", async () => {
+    const org = await program.account.organization.fetch(orgPda);
+    // acme_corp was initialized with manage_roles_permission = 3
+    assert.equal(
+      (org as any).manageRolesPermission as number,
+      3,
+      "manageRolesPermission must equal the value passed to initializeOrganization"
+    );
+
+    // originalAdmin was also set at init and must equal the creator.
+    assert.ok(
+      (org as any).originalAdmin.equals(alice.publicKey),
+      "originalAdmin must be Alice (org creator)"
+    );
+
+    // Create a fresh org with a different manage_roles_permission to confirm
+    // the field is truly per-org and not a shared constant.
+    const freshAdmin = Keypair.generate();
+    const freshSig = await provider.connection.requestAirdrop(freshAdmin.publicKey, LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(freshSig);
+
+    const freshOrgName = "fresh_mrp_org";
+    const [freshOrgPda] = findOrgPda(program.programId, freshAdmin.publicKey, freshOrgName);
+
+    await program.methods
+      .initializeOrganization(freshOrgName, 7)
+      .accounts({
+        organization: freshOrgPda,
+        authority: freshAdmin.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([freshAdmin])
+      .rpc();
+
+    const freshOrg = await program.account.organization.fetch(freshOrgPda);
+    assert.equal(
+      (freshOrg as any).manageRolesPermission as number,
+      7,
+      "fresh org must store manage_roles_permission = 7"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix L-3: createResource and deleteResource require OrgState::Idle.
+  // Calling either during an active update cycle must fail with OrgNotIdle.
+  // ---------------------------------------------------------------------------
+  it("createResource is rejected during Updating state with OrgNotIdle", async () => {
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const resourceId = new anchor.BN(77001);
+    const [resourcePda] = findResourcePda(program.programId, orgPda, resourceId);
+
+    try {
+      await program.methods
+        .createResource("should_fail", resourceId, writePermIdx)
+        .accounts({
+          resource: resourcePda,
+          organization: orgPda,
+          userPermCache: bobUpcPda,
+          authority: bob.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([bob])
+        .rpc();
+      assert.fail("expected OrgNotIdle");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "OrgNotIdle");
+    }
+
+    // Exit Updating state cleanly.
     await fullRecomputeCycle();
   });
 });

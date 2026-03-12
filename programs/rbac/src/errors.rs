@@ -120,4 +120,12 @@ pub enum RbacError {
     /// Adding another child would exceed MAX_CHILDREN_PER_ROLE for this parent role.
     #[msg("Parent role has reached the maximum number of direct children")]
     TooManyChildren,
+
+    /// The resource_creator account does not match the creator stored in the resource.
+    #[msg("Account does not match the resource creator")]
+    NotResourceCreator,
+
+    /// The proposed new super_admin is already the current super_admin.
+    #[msg("The proposed new super_admin is already the current super_admin")]
+    AlreadySuperAdmin,
 }

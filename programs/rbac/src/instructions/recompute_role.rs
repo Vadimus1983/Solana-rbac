@@ -31,7 +31,7 @@ pub struct RecomputeRole<'info> {
 
     #[account(
         mut,
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
     )]
@@ -71,6 +71,10 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     let direct_perms: Vec<u8> = ctx.accounts.role_chunk.entries[slot].direct_permissions.clone();
 
     let pcc = perm_chunk_count as usize;
+    require!(
+        pcc <= ctx.remaining_accounts.len(),
+        RbacError::AccountCountMismatch
+    );
     let perm_accounts = &ctx.remaining_accounts[..pcc];
     let role_accounts = &ctx.remaining_accounts[pcc..];
 

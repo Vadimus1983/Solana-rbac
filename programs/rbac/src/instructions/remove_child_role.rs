@@ -19,7 +19,7 @@ pub struct RemoveChildRole<'info> {
     pub role_chunk: Account<'info, RoleChunk>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
         constraint = authority.key() == organization.super_admin @ RbacError::NotSuperAdmin,
     )]
@@ -53,6 +53,7 @@ pub fn handler(ctx: Context<RemoveChildRole>, parent_index: u32, child_index: u3
     // indefinitely (add_child_role allocates +4 bytes; mirror that here).
     {
         let current_len = chunk.to_account_info().data_len();
+        require!(current_len >= 4, RbacError::RoleSlotEmpty);
         let new_space = current_len - 4;
         chunk.to_account_info().resize(new_space)?;
         let rent = Rent::get()?;

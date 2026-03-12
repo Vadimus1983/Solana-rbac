@@ -57,7 +57,7 @@ pub struct AssignRole<'info> {
     pub role_chunk: Account<'info, RoleChunk>,
 
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
     )]
     pub organization: Account<'info, Organization>,
@@ -114,7 +114,7 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
             RbacError::StalePermissions
         );
         require!(
-            has_bit(&caller_cache.effective_permissions, MANAGE_ROLES_PERMISSION_INDEX),
+            has_bit(&caller_cache.effective_permissions, org.manage_roles_permission),
             RbacError::InsufficientPermission
         );
         base_offset = 1;
@@ -123,6 +123,10 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
     }
 
     let pcc = perm_chunk_count as usize;
+    require!(
+        base_offset + pcc <= ctx.remaining_accounts.len(),
+        RbacError::AccountCountMismatch
+    );
     let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
 
     // Index perm chunks once for O(1) lookups.

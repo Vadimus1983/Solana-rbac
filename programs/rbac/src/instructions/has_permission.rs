@@ -12,7 +12,7 @@ use crate::state::*;
 #[derive(Accounts)]
 pub struct HasPermission<'info> {
     #[account(
-        seeds = [b"organization", organization.name.as_bytes()],
+        seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
         bump = organization.bump,
     )]
     pub organization: Account<'info, Organization>,
