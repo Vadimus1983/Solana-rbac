@@ -151,17 +151,39 @@ describe("rbac", () => {
     const org = await program.account.organization.fetch(targetOrgPda);
     const roleCount = org.roleCount as number;
     if (roleCount === 0) return;
+    const currentVersion = org.permissionsVersion as anchor.BN;
     const numChunks = Math.ceil(roleCount / ROLES_PER_CHUNK);
     for (let ci = 0; ci < numChunks; ci++) {
       const [chunkPda] = findRoleChunkPda(program.programId, targetOrgPda, ci);
       const chunk = await (program.account as any).roleChunk.fetch(chunkPda);
       for (const entry of chunk.entries) {
         if (!entry.active) continue;
+        // Skip roles already recomputed this cycle — makes the helper idempotent
+        // so it can be called multiple times within a single update cycle without
+        // hitting the AlreadyRecomputed guard.
+        if ((entry.recomputeEpoch as anchor.BN).eq(currentVersion)) continue;
+
         const hasDirectPerms = (entry.directPermissions as number[]).some((b: number) => b !== 0);
         const pcc = hasDirectPerms ? 1 : 0;
-        const remainingAccts = hasDirectPerms
-          ? [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }]
-          : [];
+
+        // Collect unique cross-chunk child RoleChunk PDAs (children whose chunk
+        // index differs from the role being recomputed need to be in remaining_accounts).
+        const children = entry.children as number[];
+        const crossChunkIdxSet = new Set<number>(
+          children
+            .map((c: number) => Math.floor(c / ROLES_PER_CHUNK))
+            .filter((childCi: number) => childCi !== ci)
+        );
+        const childChunkAccts = Array.from(crossChunkIdxSet).map((childCi: number) => {
+          const [cp] = findRoleChunkPda(program.programId, targetOrgPda, childCi);
+          return { pubkey: cp, isWritable: false, isSigner: false };
+        });
+
+        const remainingAccts = [
+          ...(hasDirectPerms ? [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }] : []),
+          ...childChunkAccts,
+        ];
+
         await program.methods
           .recomputeRole(entry.topoIndex as number, pcc)
           .accounts({
@@ -2215,19 +2237,8 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix Bug 1: processRecomputeBatch must reject a user that was already
-  // processed in a prior batch call.
-  //
-  // Before the fix there was no check on `ua.cached_version < target_version`,
-  // so the same user could appear in two separate processRecomputeBatch calls
-  // within the same Recomputing cycle. Each call decremented
-  // `users_pending_recompute`, allowing `finishUpdate` to succeed even though
-  // some members had never been processed.
-  //
-  // Fix: `require!(ua.cached_version < target_version, AlreadyRecomputed)`
-  // is asserted immediately after the UserAccount is deserialized. Any batch
-  // that includes an already-processed user is rejected atomically, keeping
-  // `users_pending_recompute` accurate.
+  // processRecomputeBatch must reject a user that was already processed in
+  // a prior batch call (AlreadyRecomputed), keeping users_pending_recompute accurate.
   // ---------------------------------------------------------------------------
   it("processRecomputeBatch rejects a user already processed in a prior batch call with AlreadyRecomputed", async () => {
     // Enter Recomputing state.
@@ -2387,21 +2398,122 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix Bug 2: member_count guard uses u32::MAX, not u64::MAX.
-  //
-  // commit_update casts `member_count: u64` to `u32` for `users_pending_recompute`.
-  // Before the fix, create_user_account only guarded against u64::MAX overflow,
-  // so it was possible to create > u32::MAX users and leave commit_update
-  // permanently failing with MemberCountOverflow.
-  //
-  // Fix: `require!(member_count < u32::MAX as u64, MemberCountOverflow)` in
-  // create_user_account.  The overflow threshold is now the same type boundary
-  // that commit_update requires.
-  //
-  // We cannot reach u32::MAX users in an integration test, so this test instead
-  // verifies (a) member_count increments correctly per user created, and
-  // (b) the error code used for the guard is MemberCountOverflow, confirming
-  // the guard is wired to the same error that commit_update raises.
+  // recompute_role enforces topological order: child roles must be recomputed
+  // before their parent (ChildRoleNotRecomputed).
+  // ---------------------------------------------------------------------------
+  it("recomputeRole rejects parent when child not yet recomputed with ChildRoleNotRecomputed", async () => {
+    const org0 = await program.account.organization.fetch(orgPda);
+    const roleCountBefore = (org0.roleCount as number);
+    const childIdx = roleCountBefore;
+    const parentIdx = roleCountBefore + 1;
+    const parentChunkIdx = Math.floor(parentIdx / ROLES_PER_CHUNK);
+    const [parentChunkPda] = findRoleChunkPda(program.programId, orgPda, parentChunkIdx);
+
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Recompute all existing roles FIRST so roles_pending_recompute returns to 0
+    // before we create the new child/parent roles.
+    await recomputeAllRoles(orgPda);
+
+    const chunkForCreate0 = Math.floor(roleCountBefore / ROLES_PER_CHUNK);
+    const [chunkPda0] = findRoleChunkPda(program.programId, orgPda, chunkForCreate0);
+    await program.methods
+      .createRole("_child", "")
+      .accounts({
+        roleChunk: chunkPda0,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const chunkForCreate1 = Math.floor((roleCountBefore + 1) / ROLES_PER_CHUNK);
+    const [chunkPda1] = findRoleChunkPda(program.programId, orgPda, chunkForCreate1);
+    await program.methods
+      .createRole("_parent", "")
+      .accounts({
+        roleChunk: chunkPda1,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const childChunkIdx = Math.floor(childIdx / ROLES_PER_CHUNK);
+    const childChunkPda = childChunkIdx === parentChunkIdx
+      ? parentChunkPda
+      : findRoleChunkPda(program.programId, orgPda, childChunkIdx)[0];
+    const addChildRemaining = childChunkIdx === parentChunkIdx
+      ? []
+      : [{ pubkey: childChunkPda, isWritable: false, isSigner: false }];
+
+    await program.methods
+      .addChildRole(parentIdx, childIdx)
+      .accounts({
+        roleChunk: parentChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts(addChildRemaining)
+      .rpc();
+
+    try {
+      await program.methods
+        .recomputeRole(parentIdx, 1)
+        .accounts({
+          roleChunk: parentChunkPda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }])
+        .rpc();
+      assert.fail("expected ChildRoleNotRecomputed");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "ChildRoleNotRecomputed",
+        `Expected ChildRoleNotRecomputed, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    const childChunkPdaForRecompute = findRoleChunkPda(program.programId, orgPda, childChunkIdx)[0];
+    await program.methods
+      .recomputeRole(childIdx, 1)
+      .accounts({
+        roleChunk: childChunkPdaForRecompute,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }])
+      .rpc();
+
+    await program.methods
+      .recomputeRole(parentIdx, 1)
+      .accounts({
+        roleChunk: parentChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }])
+      .rpc();
+
+    await program.methods.commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+    await completeRecomputeCycle(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // member_count increments per user; overflow guard uses MemberCountOverflow
+  // (same boundary commit_update needs for users_pending_recompute).
   // ---------------------------------------------------------------------------
   it("member_count increments per user and overflow guard uses MemberCountOverflow", async () => {
     // Snapshot member_count before creating a fresh user.
@@ -2485,19 +2597,8 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix Bug 3: permissions_version uses checked_add to prevent silent u64 wrap.
-  //
-  // Before the fix `org.permissions_version += 1` was a bare addition. In
-  // release mode an overflow would silently wrap to 0, making every user cache
-  // stamped at version 0 appear fresh again and bypassing StalePermissions.
-  //
-  // Fix: `permissions_version.checked_add(1).ok_or(VersionOverflow)?`.
-  //
-  // The actual u64::MAX boundary cannot be reached in an integration test.
-  // This test therefore acts as an explicit regression test: it verifies that
-  // commit_update increments the version by exactly 1 each time it runs, and
-  // that the new VersionOverflow error code is wired into the program (if the
-  // code ever compiles successfully, the checked_add path exists).
+  // commit_update increments permissions_version by exactly 1 each time;
+  // VersionOverflow is used when checked_add overflows.
   // ---------------------------------------------------------------------------
   it("permissions_version increments by exactly 1 on each commitUpdate", async () => {
     const orgBefore = await program.account.organization.fetch(orgPda);
@@ -2527,7 +2628,7 @@ describe("rbac", () => {
     assert.deepEqual(orgAfterCommit.state, { recomputing: {} }, "org must be Recomputing after commitUpdate");
 
     // Complete the cycle: process Bob, Carol, Dave in one call.
-    // Eve was created in the Bug2 test; her Keypair is out of scope here,
+    // Eve was created in a prior test; her Keypair is out of scope here,
     // so she is handled by the dynamic stale-UA loop below.
     await program.methods
       .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
@@ -2590,5 +2691,285 @@ describe("rbac", () => {
       versionBefore + 1,
       "final permissions_version must equal versionBefore + 1"
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // Helper: dynamic full recompute cycle (handles any number of members).
+  // ---------------------------------------------------------------------------
+  async function fullRecomputeCycle(): Promise<void> {
+    await recomputeAllRoles(orgPda);
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const org = await program.account.organization.fetch(orgPda);
+    const targetVersion = (org.permissionsVersion as anchor.BN).toNumber();
+    const allUAs = await program.account.userAccount.all([
+      { memcmp: { offset: 8, bytes: orgPda.toBase58() } },
+    ]);
+    const staleUAs = allUAs.filter(
+      (ua: any) => ua.account.cachedVersion.toNumber() < targetVersion
+    );
+    if (staleUAs.length > 0) {
+      const remainingAccts: any[] = [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }];
+      const counts: number[] = [];
+      for (const ua of staleUAs) {
+        const assignedRoles = ua.account.assignedRoles as { topoIndex: number }[];
+        const chunkIdxSet = new Set<number>(assignedRoles.map((r) => roleChunkIndex(r.topoIndex)));
+        const userChunks = Array.from(chunkIdxSet).map((ci) => {
+          const [cp] = findRoleChunkPda(program.programId, orgPda, ci);
+          return { pubkey: cp, isWritable: false, isSigner: false };
+        });
+        const [upcPda] = findUserPermCachePda(program.programId, orgPda, ua.account.user as PublicKey);
+        counts.push(userChunks.length);
+        remainingAccts.push({ pubkey: ua.publicKey, isWritable: true, isSigner: false });
+        remainingAccts.push({ pubkey: upcPda, isWritable: true, isSigner: false });
+        for (const c of userChunks) remainingAccts.push(c);
+      }
+      await program.methods
+        .processRecomputeBatch(Buffer.from(counts), 1)
+        .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts(remainingAccts)
+        .rpc();
+    }
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+  }
+
+  // ---------------------------------------------------------------------------
+  // has_role rejects role_index >= org.role_count with InvalidRoleIndex.
+  // (was previously only bounded to 256; now also bounded to role_count)
+  // ---------------------------------------------------------------------------
+  it("has_role rejects role_index >= org.role_count with InvalidRoleIndex", async () => {
+    const org = await program.account.organization.fetch(orgPda);
+    const roleCount = org.roleCount as number;
+
+    try {
+      await program.methods
+        .hasRole(roleCount) // one past the last ever-created role index
+        .accounts({
+          organization: orgPda,
+          user: bob.publicKey,
+          userPermCache: bobUpcPda,
+        })
+        .rpc();
+      assert.fail("expected InvalidRoleIndex");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "InvalidRoleIndex",
+        `Expected InvalidRoleIndex, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    // Large nonsensical index also rejected.
+    try {
+      await program.methods
+        .hasRole(9999)
+        .accounts({
+          organization: orgPda,
+          user: bob.publicKey,
+          userPermCache: bobUpcPda,
+        })
+        .rpc();
+      assert.fail("expected InvalidRoleIndex for index 9999");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "InvalidRoleIndex",
+        `Expected InvalidRoleIndex for 9999, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // remove_child_role rejects a child that is not linked to the parent,
+  // returning ChildRoleNotLinked (not the old confusing RoleNotAssigned).
+  // ---------------------------------------------------------------------------
+  it("remove_child_role rejects non-linked child with ChildRoleNotLinked", async () => {
+    // Enter Updating so structural ops are allowed.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // editor role (index 1) has no children.
+    // Trying to remove viewer (index 0) from editor must fail with ChildRoleNotLinked.
+    try {
+      await program.methods
+        .removeChildRole(editorRoleIdx, viewerRoleIdx)
+        .accounts({
+          roleChunk: roleChunk0Pda,
+          organization: orgPda,
+          authority: alice.publicKey,
+        })
+        .rpc();
+      assert.fail("expected ChildRoleNotLinked");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "ChildRoleNotLinked",
+        `Expected ChildRoleNotLinked, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    // Clean up: exit Updating state with no structural changes.
+    await fullRecomputeCycle();
+  });
+
+  // ---------------------------------------------------------------------------
+  // create_role checked_add: roles_pending_recompute increments correctly
+  // (saturating_add replaced with checked_add to detect overflow).
+  // ---------------------------------------------------------------------------
+  it("create_role increments roles_pending_recompute by 1 for each new role", async () => {
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    const orgBefore = await program.account.organization.fetch(orgPda);
+    const pendingBefore = (orgBefore.rolesPendingRecompute as number);
+    // All existing roles must already be pending recompute on beginUpdate.
+    assert.equal(pendingBefore, orgBefore.activeRoleCount as number,
+      "roles_pending_recompute must equal active_role_count after beginUpdate");
+
+    // Recompute existing roles to reset counter before creating a fresh one.
+    await recomputeAllRoles(orgPda);
+
+    const orgMid = await program.account.organization.fetch(orgPda);
+    assert.equal((orgMid.rolesPendingRecompute as number), 0,
+      "roles_pending_recompute must be 0 after recomputing all existing roles");
+
+    // Create one new role — counter must jump from 0 to 1.
+    const roleCount = orgMid.roleCount as number;
+    const chunkIdx = Math.floor(roleCount / ROLES_PER_CHUNK);
+    const [newChunkPda] = findRoleChunkPda(program.programId, orgPda, chunkIdx);
+    await program.methods
+      .createRole("_pendingTest", "")
+      .accounts({
+        roleChunk: newChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const orgAfter = await program.account.organization.fetch(orgPda);
+    assert.equal((orgAfter.rolesPendingRecompute as number), 1,
+      "roles_pending_recompute must be 1 after creating one role");
+
+    // fullRecomputeCycle calls recomputeAllRoles internally; with the idempotent
+    // skip guard it will process only the new role (old roles already done above).
+    await fullRecomputeCycle();
+  });
+
+  // ---------------------------------------------------------------------------
+  // add_child_role rejects when children list is at MAX_CHILDREN_PER_ROLE (32).
+  // Creates 33 child roles + 1 parent role to exercise the cap.
+  // ---------------------------------------------------------------------------
+  it("add_child_role rejects with TooManyChildren at cap (32 children)", async () => {
+    const MAX_CHILDREN = 32;
+
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: orgPda, authority: alice.publicKey })
+      .rpc();
+
+    // Recompute existing roles first so their pending slots are cleared.
+    await recomputeAllRoles(orgPda);
+
+    // Create MAX_CHILDREN + 1 child roles, then 1 parent role (highest index).
+    const orgBase = await program.account.organization.fetch(orgPda);
+    const baseIdx = orgBase.roleCount as number;
+
+    const createdChunkPdas: PublicKey[] = [];
+    for (let i = 0; i <= MAX_CHILDREN; i++) {
+      const idx = baseIdx + i;
+      const ci = Math.floor(idx / ROLES_PER_CHUNK);
+      const [cp] = findRoleChunkPda(program.programId, orgPda, ci);
+      createdChunkPdas.push(cp);
+      await program.methods
+        .createRole(`_cap_child_${i}`, "")
+        .accounts({
+          roleChunk: cp,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+    }
+
+    // Create the parent role (index = baseIdx + MAX_CHILDREN + 1).
+    const parentIdx = baseIdx + MAX_CHILDREN + 1;
+    const parentChunkIdx = Math.floor(parentIdx / ROLES_PER_CHUNK);
+    const [parentChunkPda] = findRoleChunkPda(program.programId, orgPda, parentChunkIdx);
+    await program.methods
+      .createRole("_cap_parent", "")
+      .accounts({
+        roleChunk: parentChunkPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Add MAX_CHILDREN children to the parent — all must succeed.
+    for (let i = 0; i < MAX_CHILDREN; i++) {
+      const childIdx = baseIdx + i;
+      const childChunkIdx = Math.floor(childIdx / ROLES_PER_CHUNK);
+      const crossChunk = childChunkIdx !== parentChunkIdx;
+      const [childChunkPda] = findRoleChunkPda(program.programId, orgPda, childChunkIdx);
+      const remaining = crossChunk
+        ? [{ pubkey: childChunkPda, isWritable: false, isSigner: false }]
+        : [];
+      await program.methods
+        .addChildRole(parentIdx, childIdx)
+        .accounts({
+          roleChunk: parentChunkPda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts(remaining)
+        .rpc();
+    }
+
+    // The (MAX_CHILDREN + 1)th add must fail with TooManyChildren.
+    const extraChildIdx = baseIdx + MAX_CHILDREN; // the unused 33rd child
+    const extraChildChunkIdx = Math.floor(extraChildIdx / ROLES_PER_CHUNK);
+    const crossChunk = extraChildChunkIdx !== parentChunkIdx;
+    const [extraChildChunkPda] = findRoleChunkPda(program.programId, orgPda, extraChildChunkIdx);
+    const extraRemaining = crossChunk
+      ? [{ pubkey: extraChildChunkPda, isWritable: false, isSigner: false }]
+      : [];
+    try {
+      await program.methods
+        .addChildRole(parentIdx, extraChildIdx)
+        .accounts({
+          roleChunk: parentChunkPda,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts(extraRemaining)
+        .rpc();
+      assert.fail("expected TooManyChildren");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "TooManyChildren",
+        `Expected TooManyChildren, got: ${(err as AnchorError).error.errorCode.code}`
+      );
+    }
+
+    // Clean up: recompute all roles and complete the cycle.
+    await fullRecomputeCycle();
   });
 });

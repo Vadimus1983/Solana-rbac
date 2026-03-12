@@ -17,6 +17,9 @@ pub const MAX_RESOURCE_TITLE_LEN: usize = 64;
 pub const ROLES_PER_CHUNK: usize = 16;
 /// Permissions 0..31 live in chunk 0, 32..63 in chunk 1, etc.
 pub const PERMS_PER_CHUNK: usize = 32;
+/// Maximum number of direct child roles a single parent role may have.
+/// Prevents unbounded account growth and O(n²) recompute costs.
+pub const MAX_CHILDREN_PER_ROLE: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Organization state machine
@@ -802,5 +805,34 @@ mod tests {
         };
         // 4(topo) + 8(ver) + (4+5)(name) + (4+0)(desc) + (4+2)(dp) + (4+2)(ep) + (4+0)(children) + 1(active) + 8(recompute_epoch)
         assert_eq!(entry.serialized_size(), 4 + 8 + 9 + 4 + 6 + 6 + 4 + 1 + 8);
+    }
+
+    // ── Recompute order: child must be recomputed before parent ─────────────
+    // recompute_role requires every child's recompute_epoch == org.permissions_version.
+    // recompute_epoch == u64::MAX means "never recomputed"; equality with
+    // permissions_version means "recomputed this update cycle".
+    #[test]
+    fn test_recompute_order_child_epoch_semantics() {
+        let org_permissions_version: u64 = 5;
+        // Child never recomputed — must not pass the "child before parent" check.
+        let child_never = RoleEntry {
+            recompute_epoch: u64::MAX,
+            ..RoleEntry::default()
+        };
+        assert_ne!(
+            child_never.recompute_epoch,
+            org_permissions_version,
+            "never-recomputed child must fail parent recompute check"
+        );
+        // Child recomputed this cycle — must pass.
+        let child_done = RoleEntry {
+            recompute_epoch: org_permissions_version,
+            ..RoleEntry::default()
+        };
+        assert_eq!(
+            child_done.recompute_epoch,
+            org_permissions_version,
+            "recomputed-this-cycle child must pass parent recompute check"
+        );
     }
 }

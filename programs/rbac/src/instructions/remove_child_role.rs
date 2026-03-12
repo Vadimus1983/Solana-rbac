@@ -45,7 +45,7 @@ pub fn handler(ctx: Context<RemoveChildRole>, parent_index: u32, child_index: u3
     require!(entry.active, RbacError::RoleInactive);
 
     let pos = entry.children.iter().position(|&c| c == child_index);
-    require!(pos.is_some(), RbacError::RoleNotAssigned);
+    require!(pos.is_some(), RbacError::ChildRoleNotLinked);
     entry.children.swap_remove(pos.unwrap());
     entry.version += 1;
 

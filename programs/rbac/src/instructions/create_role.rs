@@ -55,7 +55,10 @@ pub fn handler(ctx: Context<CreateRole>, name: String, description: String) -> R
         .ok_or(error!(RbacError::RoleCountOverflow))?;
     // New roles created during an active update cycle must also be recomputed
     // before commit_update, so claim one more pending slot.
-    org.roles_pending_recompute = org.roles_pending_recompute.saturating_add(1);
+    org.roles_pending_recompute = org
+        .roles_pending_recompute
+        .checked_add(1)
+        .ok_or(error!(RbacError::RoleCountOverflow))?;
 
     let new_entry = RoleEntry {
         topo_index,

@@ -88,8 +88,8 @@ pub enum RbacError {
     #[msg("Member count exceeds u32 maximum; cannot track recompute progress")]
     MemberCountOverflow,
 
-    /// role_count or active_role_count wrapped around u32::MAX.
-    #[msg("Role count exceeds u32 maximum")]
+    /// role_count, active_role_count, or roles_pending_recompute overflowed.
+    #[msg("Role count or recompute counter overflow")]
     RoleCountOverflow,
 
     /// Permission is not directly assigned to this user or role.
@@ -108,4 +108,16 @@ pub enum RbacError {
     /// supplied so that soft-deleted permission bits can be filtered out.
     #[msg("PermChunk accounts required when organization has permissions")]
     PermChunksRequired,
+
+    /// Child roles must be recomputed before their parent (recompute in ascending role index order).
+    #[msg("Child role must be recomputed before parent")]
+    ChildRoleNotRecomputed,
+
+    /// The child role is not in this parent role's children list.
+    #[msg("Child role is not linked to this parent role")]
+    ChildRoleNotLinked,
+
+    /// Adding another child would exceed MAX_CHILDREN_PER_ROLE for this parent role.
+    #[msg("Parent role has reached the maximum number of direct children")]
+    TooManyChildren,
 }

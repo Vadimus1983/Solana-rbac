@@ -61,6 +61,10 @@ pub fn handler(ctx: Context<AddChildRole>, parent_index: u32, child_index: u32) 
             !entry.children.contains(&child_index),
             RbacError::RoleAlreadyAssigned
         );
+        require!(
+            entry.children.len() < MAX_CHILDREN_PER_ROLE,
+            RbacError::TooManyChildren
+        );
     }
 
     // Validate child entry.

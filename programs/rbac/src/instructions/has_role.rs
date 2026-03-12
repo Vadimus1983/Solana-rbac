@@ -32,6 +32,10 @@ pub struct HasRole<'info> {
 pub fn handler(ctx: Context<HasRole>, role_index: u32) -> Result<()> {
     let cache = &ctx.accounts.user_perm_cache;
 
+    require!(
+        role_index < ctx.accounts.organization.role_count,
+        RbacError::InvalidRoleIndex
+    );
     require!(role_index < 256, RbacError::InvalidRoleIndex);
 
     // Reject stale caches — a deleted role would still appear in effective_roles

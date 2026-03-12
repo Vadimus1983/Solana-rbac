@@ -82,6 +82,44 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     };
     let role_chunk_index = build_role_chunk_index(role_accounts, &org_key, ctx.program_id)?;
 
+    let org_permissions_version = ctx.accounts.organization.permissions_version;
+    // Enforce topological order: every child must have been recomputed this cycle before this parent.
+    for &child_topo in &children {
+        let child_chunk_idx = child_topo / ROLES_PER_CHUNK as u32;
+        let child_slot = child_topo as usize % ROLES_PER_CHUNK;
+        let child_recompute_epoch = if child_chunk_idx == parent_chunk_idx {
+            let chunk = &ctx.accounts.role_chunk;
+            if child_slot < chunk.entries.len() {
+                let ce = &chunk.entries[child_slot];
+                if ce.active && ce.topo_index == child_topo {
+                    ce.recompute_epoch
+                } else {
+                    continue; // inactive or slot empty, skip check
+                }
+            } else {
+                continue;
+            }
+        } else {
+            let child_chunk = role_chunk_index
+                .get(&child_chunk_idx)
+                .ok_or(RbacError::ChunkNotFound)?;
+            if child_slot < child_chunk.entries.len() {
+                let ce = &child_chunk.entries[child_slot];
+                if ce.active && ce.topo_index == child_topo {
+                    ce.recompute_epoch
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        };
+        require!(
+            child_recompute_epoch == org_permissions_version,
+            RbacError::ChildRoleNotRecomputed
+        );
+    }
+
     // Build effective_permissions starting from direct_permissions,
     // but only include bits whose corresponding PermEntry is still active.
     let mut result: Vec<u8> = Vec::new();
@@ -216,7 +254,6 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         }
     }
 
-    let org_permissions_version = ctx.accounts.organization.permissions_version;
     let entry = &mut ctx.accounts.role_chunk.entries[slot];
     entry.effective_permissions = result;
     entry.version += 1;
