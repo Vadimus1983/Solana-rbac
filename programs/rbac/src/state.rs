@@ -428,6 +428,24 @@ pub fn clear_bit_arr(bitmask: &mut [u8], index: u32) {
     }
 }
 
+/// Returns `true` if every bit set in `subset` is also set in `superset`.
+///
+/// Used by the delegated assign/revoke path to prevent privilege escalation:
+/// a caller may only assign or revoke a role whose effective permissions are
+/// fully contained within their own effective permissions.
+pub fn bitmask_is_subset(subset: &[u8], superset: &[u8]) -> bool {
+    for (i, &byte) in subset.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        let super_byte = if i < superset.len() { superset[i] } else { 0 };
+        if byte & !super_byte != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// OR src (Vec) into dest (fixed [u8;32]) in-place.
 pub fn bitmask_union_into(dest: &mut [u8], src: &[u8]) {
     for (i, byte) in src.iter().enumerate() {
@@ -848,7 +866,86 @@ mod tests {
         );
     }
 
-    // ── C1 fix: Resource stores required_permission ───────────────────────
+    // bitmask_is_subset for delegation privilege escalation guard ──
+
+    #[test]
+    fn test_bitmask_is_subset_basic() {
+        // {0,2} ⊆ {0,1,2} — must pass
+        let mut sub = Vec::new(); set_bit(&mut sub, 0); set_bit(&mut sub, 2);
+        let mut sup = Vec::new(); set_bit(&mut sup, 0); set_bit(&mut sup, 1); set_bit(&mut sup, 2);
+        assert!(bitmask_is_subset(&sub, &sup));
+    }
+
+    #[test]
+    fn test_bitmask_is_subset_not_subset() {
+        // {0,3} ⊄ {0,1,2} — bit 3 not in superset
+        let mut sub = Vec::new(); set_bit(&mut sub, 0); set_bit(&mut sub, 3);
+        let mut sup = Vec::new(); set_bit(&mut sup, 0); set_bit(&mut sup, 1); set_bit(&mut sup, 2);
+        assert!(!bitmask_is_subset(&sub, &sup));
+    }
+
+    #[test]
+    fn test_bitmask_is_subset_empty_is_always_subset() {
+        let sub: Vec<u8> = Vec::new();
+        let mut sup = Vec::new(); set_bit(&mut sup, 5);
+        assert!(bitmask_is_subset(&sub, &sup),
+            "empty set is a subset of everything");
+    }
+
+    #[test]
+    fn test_bitmask_is_subset_equal_sets() {
+        let mut a = Vec::new(); set_bit(&mut a, 7); set_bit(&mut a, 15);
+        assert!(bitmask_is_subset(&a, &a.clone()), "A ⊆ A must hold");
+    }
+
+    #[test]
+    fn test_bitmask_is_subset_subset_longer_than_superset() {
+        // subset has a bit beyond the superset's byte length — must fail
+        let mut sub = Vec::new(); set_bit(&mut sub, 16); // byte 2
+        let sup = vec![0xFF, 0xFF]; // only bytes 0-1
+        assert!(!bitmask_is_subset(&sub, &sup),
+            "bit beyond superset length must not be treated as present");
+    }
+
+    #[test]
+    fn test_delegation_subset_check_prevents_escalation() {
+        // Scenario: caller has permission 3 (manage_roles) only.
+        // Role R has effective_permissions = {3, 7} (permissions 3 and 7).
+        // Caller wants to assign R — but R grants permission 7 which caller lacks.
+        let mut caller_perms = [0u8; 32];
+        set_bit_arr(&mut caller_perms, 3); // manage_roles only
+
+        let mut role_eff = Vec::new();
+        set_bit(&mut role_eff, 3);
+        set_bit(&mut role_eff, 7); // extra privilege
+
+        assert!(!bitmask_is_subset(&role_eff, &caller_perms),
+            "role grants permission 7 which caller lacks — must be rejected");
+
+        // If caller also holds permission 7, the assignment is allowed.
+        set_bit_arr(&mut caller_perms, 7);
+        assert!(bitmask_is_subset(&role_eff, &caller_perms),
+            "once caller holds all role permissions, assignment is permitted");
+    }
+
+    #[test]
+    fn test_delegation_subset_allows_self_assign_of_own_role() {
+        // A caller may assign a role whose permissions are ≤ their own —
+        // this is the intended delegation use-case (no escalation).
+        let mut caller_perms = [0u8; 32];
+        set_bit_arr(&mut caller_perms, 3);
+        set_bit_arr(&mut caller_perms, 5);
+        set_bit_arr(&mut caller_perms, 9);
+
+        let mut role_eff = Vec::new();
+        set_bit(&mut role_eff, 3);
+        set_bit(&mut role_eff, 5);
+
+        assert!(bitmask_is_subset(&role_eff, &caller_perms),
+            "role {{3,5}} subset of caller {{3,5,9}} — assignment must be allowed");
+    }
+
+    //  Resource stores required_permission ───────────────────────
     // Verifies that delete_resource must use the permission stored at creation
     // time, not a caller-supplied value.
     #[test]

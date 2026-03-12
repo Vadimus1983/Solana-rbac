@@ -76,7 +76,10 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
     let org_permissions_version = org.permissions_version;
 
     // Authorization: super_admin OR delegated caller with MANAGE_ROLES_PERMISSION_INDEX.
+    // On the delegated path we also capture the caller's effective_permissions so
+    // we can enforce the subset check below (prevents privilege escalation).
     let base_offset: usize;
+    let caller_effective_perms: Option<[u8; 32]>;
     if ctx.accounts.authority.key() != org.super_admin {
         require!(!ctx.remaining_accounts.is_empty(), RbacError::NotSuperAdmin);
 
@@ -117,8 +120,10 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
             has_bit(&caller_cache.effective_permissions, org.manage_roles_permission),
             RbacError::InsufficientPermission
         );
+        caller_effective_perms = Some(caller_cache.effective_permissions);
         base_offset = 1;
     } else {
+        caller_effective_perms = None;
         base_offset = 0;
     }
 
@@ -181,6 +186,17 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         // effective_permissions can no longer contain deleted-permission bits.
         raw_effective
     };
+
+    // Delegated-path privilege-escalation guard: the role's effective permissions
+    // must be a subset of the caller's own permissions.  Without this check a
+    // delegated manager could assign (or later hold) permissions they were never
+    // explicitly granted.
+    if let Some(ref caller_perms) = caller_effective_perms {
+        require!(
+            bitmask_is_subset(&entry_effective, caller_perms),
+            RbacError::InsufficientPermission
+        );
+    }
 
     let ua = &mut ctx.accounts.user_account;
     require!(

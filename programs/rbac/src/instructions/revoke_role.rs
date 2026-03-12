@@ -15,6 +15,7 @@ use crate::state::*;
 ///   - If delegated: remaining_accounts[0] is caller's UserPermCache,
 ///     remaining_accounts[1..] are role chunks.
 #[derive(Accounts)]
+#[instruction(role_index: u32)]
 pub struct RevokeRole<'info> {
     #[account(
         mut,
@@ -39,6 +40,20 @@ pub struct RevokeRole<'info> {
         constraint = user_perm_cache.organization == organization.key(),
     )]
     pub user_perm_cache: Account<'info, UserPermCache>,
+
+    /// The chunk containing the role being revoked (readonly).  Required on
+    /// the delegated path so we can verify the caller holds all permissions
+    /// of that role (subset check), preventing privilege escalation via revoke.
+    #[account(
+        seeds = [
+            b"role_chunk",
+            organization.key().as_ref(),
+            &(role_index / ROLES_PER_CHUNK as u32).to_le_bytes(),
+        ],
+        bump = role_chunk.bump,
+        constraint = role_chunk.organization == organization.key(),
+    )]
+    pub role_chunk: Account<'info, RoleChunk>,
 
     #[account(
         seeds = [b"organization", organization.original_admin.as_ref(), organization.name.as_bytes()],
@@ -74,7 +89,10 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
     let org_permissions_version = org.permissions_version;
 
     // Authorization check; determine where perm_chunks start in remaining_accounts.
+    // On the delegated path we also capture the caller's effective_permissions
+    // so we can enforce the subset check below.
     let base_offset: usize;
+    let caller_effective_perms: Option<[u8; 32]>;
     if ctx.accounts.authority.key() != org.super_admin {
         require!(!ctx.remaining_accounts.is_empty(), RbacError::NotSuperAdmin);
 
@@ -114,9 +132,27 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
             has_bit(&caller_cache.effective_permissions, org.manage_roles_permission),
             RbacError::InsufficientPermission
         );
+        caller_effective_perms = Some(caller_cache.effective_permissions);
         base_offset = 1;
     } else {
+        caller_effective_perms = None;
         base_offset = 0;
+    }
+
+    // Delegated-path privilege-escalation guard: a delegated manager may only
+    // revoke a role whose effective permissions are a subset of their own.
+    // We read from the named role_chunk (in Idle state its effective_permissions
+    // are already filtered by the last recompute_role call, so raw == filtered).
+    if let Some(ref caller_perms) = caller_effective_perms {
+        let slot = role_index as usize % ROLES_PER_CHUNK;
+        let chunk = &ctx.accounts.role_chunk;
+        require!(slot < chunk.entries.len(), RbacError::RoleSlotEmpty);
+        let entry = &chunk.entries[slot];
+        require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
+        require!(
+            bitmask_is_subset(&entry.effective_permissions, caller_perms),
+            RbacError::InsufficientPermission
+        );
     }
 
     require!(
