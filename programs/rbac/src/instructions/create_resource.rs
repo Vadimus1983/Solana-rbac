@@ -55,6 +55,7 @@ pub fn handler(
         title.len() <= MAX_RESOURCE_TITLE_LEN,
         RbacError::ResourceTitleTooLong
     );
+    require!(required_permission < 256, RbacError::InvalidPermissionIndex);
 
     let cache = &ctx.accounts.user_perm_cache;
     let org = &ctx.accounts.organization;
