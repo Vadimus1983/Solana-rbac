@@ -65,6 +65,10 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32, perm_c
         org.next_permission_index == 0 || pcc > 0,
         RbacError::PermChunksRequired
     );
+    require!(
+        pcc <= ctx.remaining_accounts.len(),
+        RbacError::AccountCountMismatch
+    );
 
     let ua = &mut ctx.accounts.user_account;
     require!(permission_index < next_permission_index, RbacError::InvalidPermissionIndex);

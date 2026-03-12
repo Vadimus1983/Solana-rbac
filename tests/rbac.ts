@@ -635,6 +635,7 @@ describe("rbac", () => {
       .accounts({
         userAccount: bobUaPda,
         userPermCache: bobUpcPda,
+        roleChunk: roleChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -1125,6 +1126,7 @@ describe("rbac", () => {
         .accounts({
           userAccount: daveUaPda,
           userPermCache: daveUpcPda,
+          roleChunk: roleChunk0Pda,
           organization: orgPda,        // target: acme_corp
           authority: carol.publicKey,  // carol signs
           systemProgram: SystemProgram.programId,
@@ -1158,53 +1160,55 @@ describe("rbac", () => {
     // Give carol MANAGE_ROLES in acme_corp itself so she has a valid delegation cache.
     // acme_corp currently has next_permission_index = 3; MANAGE_ROLES_PERM_IDX = 3.
     // Run a minimal update cycle to create perm 3 ("manage_roles") in acme_corp.
-    await program.methods
-      .beginUpdate()
-      .accounts({ organization: orgPda, authority: alice.publicKey })
-      .rpc();
+    // On any failure (e.g. ProgramAccountNotFound), ensure we leave org Idle so later tests don't see OrgNotIdle.
+    try {
+      await program.methods
+        .beginUpdate()
+        .accounts({ organization: orgPda, authority: alice.publicKey })
+        .rpc();
 
-    await program.methods
-      .createPermission("manage_roles", "Allows managing role assignments")
-      .accounts({
-        permChunk: permChunk0Pda,   // perm index 3 lands in chunk 0 (indices 0-31)
-        organization: orgPda,
-        authority: alice.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
+      await program.methods
+        .createPermission("manage_roles", "Allows managing role assignments")
+        .accounts({
+          permChunk: permChunk0Pda,   // perm index 3 lands in chunk 0 (indices 0-31)
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
 
-    // Recompute all active roles (roles_pending_recompute must be 0 at commitUpdate).
-    await recomputeAllRoles(orgPda);
+      // Recompute all active roles (roles_pending_recompute must be 0 at commitUpdate).
+      await recomputeAllRoles(orgPda);
 
-    await program.methods
-      .commitUpdate()
-      .accounts({ organization: orgPda, authority: alice.publicKey })
-      .rpc();
+      await program.methods
+        .commitUpdate()
+        .accounts({ organization: orgPda, authority: alice.publicKey })
+        .rpc();
 
-    // Process ALL members (Bob=editor/chunk0, Carol=viewer/chunk0, Dave=viewer/chunk0).
-    await program.methods
-      .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
-      .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
-      .remainingAccounts([
-        { pubkey: permChunk0Pda,  isWritable: false, isSigner: false },
-        { pubkey: bobUaPda,       isWritable: true,  isSigner: false },
-        { pubkey: bobUpcPda,      isWritable: true,  isSigner: false },
-        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
-        { pubkey: carolUaPda,     isWritable: true,  isSigner: false },
-        { pubkey: carolUpcPda,    isWritable: true,  isSigner: false },
-        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
-        { pubkey: daveUaPda,      isWritable: true,  isSigner: false },
-        { pubkey: daveUpcPda,     isWritable: true,  isSigner: false },
-        { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
-      ])
-      .rpc();
+      // Process ALL members (Bob=editor/chunk0, Carol=viewer/chunk0, Dave=viewer/chunk0).
+      await program.methods
+        .processRecomputeBatch(Buffer.from([1, 1, 1]), 1)
+        .accounts({ organization: orgPda, authority: alice.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts([
+          { pubkey: permChunk0Pda,  isWritable: false, isSigner: false },
+          { pubkey: bobUaPda,       isWritable: true,  isSigner: false },
+          { pubkey: bobUpcPda,      isWritable: true,  isSigner: false },
+          { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+          { pubkey: carolUaPda,     isWritable: true,  isSigner: false },
+          { pubkey: carolUpcPda,    isWritable: true,  isSigner: false },
+          { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+          { pubkey: daveUaPda,      isWritable: true,  isSigner: false },
+          { pubkey: daveUpcPda,     isWritable: true,  isSigner: false },
+          { pubkey: roleChunk0Pda,  isWritable: false, isSigner: false },
+        ])
+        .rpc();
 
-    await program.methods
-      .finishUpdate()
-      .accounts({ organization: orgPda, authority: alice.publicKey })
-      .rpc();
+      await program.methods
+        .finishUpdate()
+        .accounts({ organization: orgPda, authority: alice.publicKey })
+        .rpc();
 
-    // In Idle: grant carol MANAGE_ROLES (index 3) directly in acme_corp.
+      // In Idle: grant carol MANAGE_ROLES (index 3) directly in acme_corp.
     // Pass permChunk so the handler verifies the permission is active.
     await program.methods
       .assignUserPermission(MANAGE_ROLES_PERM_IDX)
@@ -1230,6 +1234,7 @@ describe("rbac", () => {
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
+        roleChunk: roleChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -1270,6 +1275,19 @@ describe("rbac", () => {
       hasBit(daveCache.effectivePermissions as number[], readPermIdx),
       "dave should have read permission from viewer role"
     );
+    } finally {
+      // If the test failed partway (e.g. ProgramAccountNotFound), org may be Updating or Recomputing.
+      // Complete the cycle so later tests see Idle.
+      const org = await program.account.organization.fetch(orgPda);
+      const state = (org.state as any);
+      if (state.updating !== undefined) {
+        await recomputeAllRoles(orgPda);
+        await program.methods.commitUpdate().accounts({ organization: orgPda, authority: alice.publicKey }).rpc();
+        await completeRecomputeCycle(1);
+      } else if (state.recomputing !== undefined) {
+        await completeRecomputeCycle(1);
+      }
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -1448,6 +1466,7 @@ describe("rbac", () => {
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
+        roleChunk: roleChunk0Pda,
         organization: orgPda,
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
@@ -2380,6 +2399,7 @@ describe("rbac", () => {
         .accounts({
           userAccount: bobUaPda,
           userPermCache: bobUpcPda,
+          roleChunk: roleChunk0Pda,
           organization: orgPda,
           authority: alice.publicKey,
           systemProgram: SystemProgram.programId,
@@ -3142,7 +3162,7 @@ describe("rbac", () => {
     // Attempt to delete while passing Carol (not the creator) as resource_creator.
     try {
       await program.methods
-        .deleteResource(writePermIdx)
+        .deleteResource()
         .accounts({
           resource: resourcePda,
           organization: orgPda,
@@ -3163,7 +3183,7 @@ describe("rbac", () => {
 
     // Correct deletion: resource_creator == resource.creator (Bob).
     await program.methods
-      .deleteResource(writePermIdx)
+      .deleteResource()
       .accounts({
         resource: resourcePda,
         organization: orgPda,

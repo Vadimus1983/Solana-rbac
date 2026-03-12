@@ -50,6 +50,10 @@ pub fn handler(
         org.next_permission_index == 0 || pcc > 0,
         RbacError::PermChunksRequired
     );
+    require!(
+        pcc <= ctx.remaining_accounts.len(),
+        RbacError::AccountCountMismatch
+    );
 
     let target_version = org.permissions_version;
     let org_key = ctx.accounts.organization.key();

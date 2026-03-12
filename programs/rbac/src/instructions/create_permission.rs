@@ -90,7 +90,8 @@ pub fn handler(ctx: Context<CreatePermission>, name: String, description: String
         init_chunk.try_serialize(&mut &mut data[..])?;
     }
 
-    // Deserialize the current chunk state.
+    // Deserialize the current chunk state (owner check when not init).
+    require!(chunk_info.owner == ctx.program_id, RbacError::MissingAuthProof);
     let mut chunk = {
         let data = chunk_info.try_borrow_data()?;
         PermChunk::try_deserialize(&mut &data[..])?

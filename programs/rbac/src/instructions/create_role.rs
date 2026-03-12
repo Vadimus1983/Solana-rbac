@@ -108,7 +108,8 @@ pub fn handler(ctx: Context<CreateRole>, name: String, description: String) -> R
         init_chunk.try_serialize(&mut &mut data[..])?;
     }
 
-    // Deserialize the current chunk state.
+    // Deserialize the current chunk state (owner check when not init).
+    require!(chunk_info.owner == ctx.program_id, RbacError::MissingAuthProof);
     let mut chunk = {
         let data = chunk_info.try_borrow_data()?;
         RoleChunk::try_deserialize(&mut &data[..])?
