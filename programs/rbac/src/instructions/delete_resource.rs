@@ -12,6 +12,7 @@ pub struct DeleteResource<'info> {
         seeds = [
             b"resource",
             organization.key().as_ref(),
+            resource_creator.key().as_ref(),
             &resource.resource_id.to_le_bytes(),
         ],
         bump = resource.bump,

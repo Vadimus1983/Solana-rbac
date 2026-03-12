@@ -18,7 +18,9 @@ pub struct TransferSuperAdmin<'info> {
     pub organization: Account<'info, Organization>,
 
     /// The account that will become the new super_admin.
-    pub new_super_admin: SystemAccount<'info>,
+    /// Must sign to prove the new admin acknowledges the transfer and holds
+    /// the corresponding private key — prevents locking the org to a dead address.
+    pub new_super_admin: Signer<'info>,
 
     #[account(mut)]
     pub authority: Signer<'info>,

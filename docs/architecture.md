@@ -33,6 +33,7 @@
 13. [Permission Bitmask Encoding](#13-permission-bitmask-encoding)
 14. [Role Tree — Implemented (Children-First DAG)](#14-role-tree--implemented-children-first-dag)
 15. [RoleRef — Per-Role Staleness Tracking](#15-roleref--per-role-staleness-tracking)
+16. [Future Improvements](#16-future-improvements)
 
 ---
 
@@ -1078,3 +1079,13 @@ graph LR
 ```
 
 `RoleRef.last_seen_version` is updated on every `assign_role`, `revoke_role`, `assign_user_permission`, `revoke_user_permission`, and `process_recompute_batch`. Off-chain clients can detect staleness without a transaction by comparing these fields.
+
+---
+
+## 16. Future Improvements
+
+### Batch size and compute limits
+
+Very large batches (e.g. many users in `process_recompute_batch`, or many RoleChunks/PermChunks in `assign_role` / `revoke_role`) can hit Solana’s compute or account-per-tx limits and cause the transaction to fail.
+
+**What clients can do until then:** Keep batches small (e.g. fewer users per `process_recompute_batch` call, fewer chunks per `assign_role` / `revoke_role`). If a transaction fails with a compute or account-related error, split the work into multiple transactions with smaller batches and retry.

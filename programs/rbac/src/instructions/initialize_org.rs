@@ -23,6 +23,7 @@ pub struct InitializeOrganization<'info> {
 
 pub fn handler(ctx: Context<InitializeOrganization>, name: String, manage_roles_permission: u32) -> Result<()> {
     require!(name.len() <= MAX_ORG_NAME_LEN, RbacError::OrgNameTooLong);
+    require!(manage_roles_permission < 256, RbacError::InvalidPermissionIndex);
 
     let org = &mut ctx.accounts.organization;
     org.super_admin = ctx.accounts.authority.key();

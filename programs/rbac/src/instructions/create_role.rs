@@ -44,7 +44,7 @@ pub fn handler(ctx: Context<CreateRole>, name: String, description: String) -> R
 
     // UserPermCache.effective_roles is a fixed [u8; 32] (256-bit bitmask).
     // set_bit_arr is a silent no-op for index >= 256, so cap here.
-    require!(org.active_role_count < 256, RbacError::RoleCountOverflow);
+    require!(org.role_count < 256, RbacError::RoleCountOverflow);
 
     org.role_count = topo_index
         .checked_add(1)

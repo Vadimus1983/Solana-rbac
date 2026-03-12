@@ -91,12 +91,14 @@ function findUserPermCachePda(
 function findResourcePda(
   programId: PublicKey,
   orgKey: PublicKey,
+  creator: PublicKey,
   resourceId: anchor.BN
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [
       Buffer.from("resource"),
       orgKey.toBuffer(),
+      creator.toBuffer(),
       resourceId.toArrayLike(Buffer, "le", 8),
     ],
     programId
@@ -418,7 +420,7 @@ describe("security-and-edge", () => {
     it("deleteResource: resource_creator != resource.creator rejected with NotResourceCreator", async () => {
       // Attack: close resource to Carol instead of the actual creator (Bob).
       const resourceId = new anchor.BN(9001);
-      const [resourcePda] = findResourcePda(program.programId, orgPda, resourceId);
+      const [resourcePda] = findResourcePda(program.programId, orgPda, bob.publicKey, resourceId);
       await program.methods
         .assignUserPermission(perm0)
         .accounts({
@@ -455,9 +457,15 @@ describe("security-and-edge", () => {
           })
           .signers([bob])
           .rpc();
-        assert.fail("expected NotResourceCreator");
+        assert.fail("expected ConstraintSeeds");
       } catch (err) {
-        assertRbacError(err, "NotResourceCreator");
+        // resource_creator is part of PDA seeds — Anchor rejects wrong creator
+        // at account validation (ConstraintSeeds) before the handler runs.
+        assert.instanceOf(err, AnchorError);
+        assert.equal(
+          (err as AnchorError).error.errorCode.code,
+          "ConstraintSeeds"
+        );
       }
     });
   });
@@ -1085,7 +1093,7 @@ describe("security-and-edge", () => {
         .rpc();
 
       const resourceId = new anchor.BN(8001);
-      const [resourcePda] = findResourcePda(program.programId, orgPda, resourceId);
+      const [resourcePda] = findResourcePda(program.programId, orgPda, bob.publicKey, resourceId);
       await program.methods
         .createResource("R", resourceId, perm1)
         .accounts({
@@ -1136,6 +1144,7 @@ describe("security-and-edge", () => {
           newSuperAdmin: carol.publicKey,
           authority: alice.publicKey,
         })
+        .signers([carol])
         .rpc();
 
       try {
@@ -1146,6 +1155,7 @@ describe("security-and-edge", () => {
             newSuperAdmin: bob.publicKey,
             authority: alice.publicKey, // no longer super_admin
           })
+          .signers([bob])
           .rpc();
         assert.fail("expected NotSuperAdmin");
       } catch (err) {

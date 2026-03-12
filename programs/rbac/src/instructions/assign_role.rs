@@ -165,15 +165,15 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
                     let perm_index_val = (byte_idx as u32) * 8 + bit;
                     let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
                     let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
-                    if let Some(perm_chunk) =
-                        perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
+                    let perm_chunk = perm_index
+                        .as_ref()
+                        .and_then(|idx| idx.get(&perm_chunk_idx))
+                        .ok_or(RbacError::ChunkNotFound)?;
+                    if perm_slot < perm_chunk.entries.len()
+                        && perm_chunk.entries[perm_slot].index == perm_index_val
+                        && perm_chunk.entries[perm_slot].active
                     {
-                        if perm_slot < perm_chunk.entries.len()
-                            && perm_chunk.entries[perm_slot].index == perm_index_val
-                            && perm_chunk.entries[perm_slot].active
-                        {
-                            set_bit(&mut filtered, perm_index_val);
-                        }
+                        set_bit(&mut filtered, perm_index_val);
                     }
                 }
             }

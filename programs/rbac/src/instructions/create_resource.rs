@@ -14,6 +14,7 @@ pub struct CreateResource<'info> {
         seeds = [
             b"resource",
             organization.key().as_ref(),
+            authority.key().as_ref(),
             &resource_id.to_le_bytes(),
         ],
         bump,

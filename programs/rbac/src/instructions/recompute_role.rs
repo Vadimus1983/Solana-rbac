@@ -197,32 +197,67 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
             for bit in 0..8u32 {
                 if byte & (1 << bit) != 0 {
                     let perm_index_val = (byte_idx as u32) * 8 + bit;
-                    let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
-                    let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
-                    if let Some(perm_chunk) =
-                        perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
-                    {
+                    if pcc > 0 {
+                        let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
+                        let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
+                        let perm_chunk = perm_index
+                            .as_ref()
+                            .and_then(|idx| idx.get(&perm_chunk_idx))
+                            .ok_or(RbacError::ChunkNotFound)?;
                         if perm_slot < perm_chunk.entries.len()
                             && perm_chunk.entries[perm_slot].index == perm_index_val
                             && perm_chunk.entries[perm_slot].active
                         {
                             set_bit(&mut result, perm_index_val);
                         }
-                        // inactive or not found → bit dropped
+                    } else {
+                        // pcc == 0: trust the child's stored effective_permissions.
+                        // Safe: topological ordering ensures children were freshly
+                        // recomputed this cycle (recompute_epoch == permissions_version),
+                        // so their effective_permissions are clean.
+                        set_bit(&mut result, perm_index_val);
                     }
-                    // chunk not supplied → treat as inactive
                 }
             }
         }
     }
 
-    // Grow or shrink the chunk based on new vs old effective_permissions length.
+    // Build pruned children list — remove entries for inactive or missing roles
+    // so dead references don't permanently consume MAX_CHILDREN_PER_ROLE slots.
+    let mut new_children: Vec<u32> = Vec::new();
+    for &child_topo in &children {
+        let child_chunk_idx = child_topo / ROLES_PER_CHUNK as u32;
+        let child_slot = child_topo as usize % ROLES_PER_CHUNK;
+        let is_active = if child_chunk_idx == parent_chunk_idx {
+            let chunk = &ctx.accounts.role_chunk;
+            child_slot < chunk.entries.len()
+                && chunk.entries[child_slot].active
+                && chunk.entries[child_slot].topo_index == child_topo
+        } else {
+            role_chunk_index
+                .get(&child_chunk_idx)
+                .map_or(false, |chunk| {
+                    child_slot < chunk.entries.len()
+                        && chunk.entries[child_slot].active
+                        && chunk.entries[child_slot].topo_index == child_topo
+                })
+        };
+        if is_active {
+            new_children.push(child_topo);
+        }
+    }
+
+    // Combined size delta: effective_permissions change + children Vec change.
     let old_eff_len = ctx.accounts.role_chunk.entries[slot].effective_permissions.len();
+    let old_children_count = ctx.accounts.role_chunk.entries[slot].children.len();
     let new_eff_len = result.len();
-    if new_eff_len > old_eff_len {
-        let growth = new_eff_len - old_eff_len;
-        let current_len = ctx.accounts.role_chunk.to_account_info().data_len();
-        let new_space = current_len + growth;
+    let new_children_count = new_children.len();
+    let delta: isize = (new_eff_len as isize - old_eff_len as isize)
+        + ((new_children_count as isize - old_children_count as isize) * 4);
+
+    let current_len = ctx.accounts.role_chunk.to_account_info().data_len();
+    let new_space = (current_len as isize + delta) as usize;
+    if delta > 0 {
         let rent = Rent::get()?;
         let new_min = rent.minimum_balance(new_space);
         let current_lamports = ctx.accounts.role_chunk.to_account_info().lamports();
@@ -240,13 +275,7 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
             )?;
         }
         ctx.accounts.role_chunk.to_account_info().resize(new_space)?;
-    } else if new_eff_len < old_eff_len {
-        // Reclaim account space when effective_permissions shrinks (e.g. after
-        // a permission deletion cycle) and return excess lamports to the
-        // authority so rent is not locked unnecessarily.
-        let shrinkage = old_eff_len - new_eff_len;
-        let current_len = ctx.accounts.role_chunk.to_account_info().data_len();
-        let new_space = current_len - shrinkage;
+    } else if delta < 0 {
         ctx.accounts.role_chunk.to_account_info().resize(new_space)?;
         let rent = Rent::get()?;
         let new_min = rent.minimum_balance(new_space);
@@ -260,6 +289,7 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
 
     let entry = &mut ctx.accounts.role_chunk.entries[slot];
     entry.effective_permissions = result;
+    entry.children = new_children;
     entry.version += 1;
     entry.recompute_epoch = org_permissions_version;
 

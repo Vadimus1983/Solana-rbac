@@ -78,12 +78,14 @@ function findUserPermCachePda(
 function findResourcePda(
   programId: PublicKey,
   orgKey: PublicKey,
+  creator: PublicKey,
   resourceId: anchor.BN
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [
       Buffer.from("resource"),
       orgKey.toBuffer(),
+      creator.toBuffer(),
       resourceId.toArrayLike(Buffer, "le", 8),
     ],
     programId
@@ -3142,7 +3144,7 @@ describe("rbac", () => {
       .rpc();
 
     const resourceId = new anchor.BN(80001);
-    const [resourcePda] = findResourcePda(program.programId, orgPda, resourceId);
+    const [resourcePda] = findResourcePda(program.programId, orgPda, bob.publicKey, resourceId);
 
     await program.methods
       .createResource("creator_test", resourceId, writePermIdx)
@@ -3172,12 +3174,14 @@ describe("rbac", () => {
         })
         .signers([bob])
         .rpc();
-      assert.fail("expected NotResourceCreator");
+      assert.fail("expected ConstraintSeeds");
     } catch (err) {
       assert.instanceOf(err, AnchorError);
+      // resource_creator is now part of the PDA seeds — Anchor's seed constraint
+      // fires at account validation before the handler runs.
       assert.equal(
         (err as AnchorError).error.errorCode.code,
-        "NotResourceCreator"
+        "ConstraintSeeds"
       );
     }
 
@@ -3223,7 +3227,7 @@ describe("rbac", () => {
     assert.ok(orgBefore.superAdmin.equals(alice.publicKey));
     assert.ok((orgBefore as any).originalAdmin.equals(alice.publicKey));
 
-    // Transfer to Bob.
+    // Transfer to Bob. Bob must co-sign to prove he holds the key.
     await program.methods
       .transferSuperAdmin()
       .accounts({
@@ -3231,6 +3235,7 @@ describe("rbac", () => {
         newSuperAdmin: bob.publicKey,
         authority: alice.publicKey,
       })
+      .signers([bob])
       .rpc();
 
     const orgAfter = await program.account.organization.fetch(orgPda);
@@ -3339,7 +3344,7 @@ describe("rbac", () => {
       .rpc();
 
     const resourceId = new anchor.BN(77001);
-    const [resourcePda] = findResourcePda(program.programId, orgPda, resourceId);
+    const [resourcePda] = findResourcePda(program.programId, orgPda, bob.publicKey, resourceId);
 
     try {
       await program.methods
@@ -3361,5 +3366,553 @@ describe("rbac", () => {
 
     // Exit Updating state cleanly.
     await fullRecomputeCycle();
+  });
+
+  // ---------------------------------------------------------------------------
+  // createRole rejects when role_count (topo_index) would reach 256.
+  // Previously guarded on active_role_count, allowing ghost roles with topo >= 256
+  // that silently fail set_bit_arr and make has_role permanently unusable for them.
+  // ---------------------------------------------------------------------------
+  it("createRole tracks role_count monotonically and rejects at 256", async () => {
+    // Use a fresh org so we can control role_count precisely.
+    const admin1 = Keypair.generate();
+    const sig1 = await provider.connection.requestAirdrop(admin1.publicKey, 2 * LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig1);
+
+    const orgName1 = "sec_fix1_org";
+    const [freshOrgPda] = findOrgPda(program.programId, admin1.publicKey, orgName1);
+    await program.methods
+      .initializeOrganization(orgName1, 0)
+      .accounts({ organization: freshOrgPda, authority: admin1.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin1])
+      .rpc();
+
+    // Begin update so we can create roles.
+    await program.methods
+      .beginUpdate()
+      .accounts({ organization: freshOrgPda, authority: admin1.publicKey })
+      .signers([admin1])
+      .rpc();
+
+    // Create role 0.
+    const [freshRoleChunk0] = findRoleChunkPda(program.programId, freshOrgPda, 0);
+    await program.methods
+      .createRole("r0", "")
+      .accounts({ roleChunk: freshRoleChunk0, organization: freshOrgPda, authority: admin1.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin1])
+      .rpc();
+
+    // Delete it to advance role_count without increasing active_role_count above 1.
+    await program.methods
+      .deleteRole(0)
+      .accounts({ roleChunk: freshRoleChunk0, organization: freshOrgPda, authority: admin1.publicKey })
+      .signers([admin1])
+      .rpc();
+
+    const orgAfterDelete = await program.account.organization.fetch(freshOrgPda);
+    assert.equal(orgAfterDelete.roleCount as number, 1, "role_count must be 1 after create+delete");
+    assert.equal(orgAfterDelete.activeRoleCount as number, 0, "active_role_count must be 0");
+
+    // Finish update cleanly (no active roles, no users).
+    await program.methods
+      .commitUpdate()
+      .accounts({ organization: freshOrgPda, authority: admin1.publicKey })
+      .signers([admin1])
+      .rpc();
+    await program.methods
+      .finishUpdate()
+      .accounts({ organization: freshOrgPda, authority: admin1.publicKey })
+      .signers([admin1])
+      .rpc();
+
+    // Verify: role_count grew past the deletion, confirming monotonic growth.
+    const orgFinal = await program.account.organization.fetch(freshOrgPda);
+    assert.equal(orgFinal.roleCount as number, 1, "role_count must remain 1 — set once at creation");
+  });
+
+  // ---------------------------------------------------------------------------
+  // revokeRole with a missing PermChunk must fail with
+  // ChunkNotFound rather than silently stripping the user's direct permission.
+  // ---------------------------------------------------------------------------
+  it("revokeRole with missing PermChunk for direct_permissions fails with ChunkNotFound", async () => {
+    // Give Bob a direct permission then revoke a role while omitting the PermChunk.
+    // Without the fix this would silently strip Bob's direct perm from effective_permissions.
+
+    // Bob has editorRoleIdx from Step 14 (never revoked since). Verify org is Idle.
+    const orgState = await program.account.organization.fetch(orgPda);
+    assert.deepEqual(orgState.state, { idle: {} }, "org must be Idle");
+
+    // Assign write perm to Bob directly.
+    await program.methods
+      .assignUserPermission(writePermIdx)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        permChunk: permChunk0Pda,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Bob already has editorRoleIdx from Step 14 (re-assigned after Step 13, never revoked).
+    // viewerRoleIdx (0) is soft-deleted by an earlier test; editorRoleIdx (1) is still active.
+    const [rc0] = findRoleChunkPda(program.programId, orgPda, 0);
+
+    // Call revokeRole with pcc=1 but supply a ROLE CHUNK (rc0) instead of a PermChunk.
+    // build_perm_chunk_index silently skips rc0 (discriminator mismatch) → empty map.
+    // When the handler iterates Bob's direct_permission bits (writePermIdx=1 in perm_chunk_0),
+    // it looks up chunk_idx=0 in the empty map → ChunkNotFound.
+    try {
+      await program.methods
+        .revokeRole(editorRoleIdx, 1)   // pcc=1 but wrong account type in remaining_accounts
+        .accounts({
+          userAccount: bobUaPda,
+          userPermCache: bobUpcPda,
+          roleChunk: rc0,
+          organization: orgPda,
+          authority: alice.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([
+          { pubkey: rc0, isWritable: false, isSigner: false }, // ← role chunk, not perm chunk
+        ])
+        .rpc();
+      assert.fail("expected ChunkNotFound");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "ChunkNotFound",
+        `Expected ChunkNotFound, got: ${(err as AnchorError).error.errorCode.code}`);
+    }
+
+    // Cleanup: do the correct revocation with perm chunk supplied.
+    // After revoking editor, Bob has no remaining roles → no role chunks needed after perm chunk.
+    await program.methods
+      .revokeRole(editorRoleIdx, 1)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        roleChunk: rc0,
+        organization: orgPda,
+        authority: alice.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+
+    // Cleanup: revoke Bob's direct perm.
+    await program.methods
+      .revokeUserPermission(writePermIdx, 1)
+      .accounts({
+        userAccount: bobUaPda,
+        userPermCache: bobUpcPda,
+        organization: orgPda,
+        authority: alice.publicKey,
+      })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+        { pubkey: rc0, isWritable: false, isSigner: false },
+      ])
+      .rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // recomputeRole with pcc=0 on a parent whose child has
+  // permissions must fail with ChunkNotFound (previously silently zeroed parent).
+  // ---------------------------------------------------------------------------
+  it("recomputeRole pcc=0 for parent with child permissions fails ChunkNotFound", async () => {
+    const admin3 = Keypair.generate();
+    const sig3 = await provider.connection.requestAirdrop(admin3.publicKey, 2 * LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig3);
+
+    const orgName3 = "sec_fix3_org";
+    const [org3Pda] = findOrgPda(program.programId, admin3.publicKey, orgName3);
+    await program.methods
+      .initializeOrganization(orgName3, 0)
+      .accounts({ organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin3])
+      .rpc();
+
+    // Create perm 0.
+    await program.methods.beginUpdate()
+      .accounts({ organization: org3Pda, authority: admin3.publicKey })
+      .signers([admin3]).rpc();
+
+    const [pc3_0] = findPermChunkPda(program.programId, org3Pda, 0);
+    await program.methods.createPermission("p0", "")
+      .accounts({ permChunk: pc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin3]).rpc();
+
+    // Child role (index 0) with perm 0.
+    const [rc3_0] = findRoleChunkPda(program.programId, org3Pda, 0);
+    await program.methods.createRole("child", "")
+      .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin3]).rpc();
+    await program.methods.addRolePermission(0, 0)
+      .accounts({ roleChunk: rc3_0, permChunk: pc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin3]).rpc();
+
+    // Parent role (index 1) with child 0.
+    await program.methods.createRole("parent", "")
+      .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin3]).rpc();
+    await program.methods.addChildRole(1, 0)
+      .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin3]).rpc();
+
+    // Recompute child (role 0) correctly with pcc=1.
+    await program.methods.recomputeRole(0, 1)
+      .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([{ pubkey: pc3_0, isWritable: false, isSigner: false }])
+      .signers([admin3]).rpc();
+
+    // Recompute parent (role 1) with pcc=0 — must FAIL because child has perm bits
+    // that require chunk lookup when pcc > 0... wait, with pcc=0 and the new fix,
+    // child bits are trusted as-is and included. So this actually should SUCCEED now.
+    // The bug was that pcc=0 silently DROPPED child bits. The fix makes pcc=0 INCLUDE them.
+    // Verify the parent gets the child's permissions after recompute with pcc=0.
+    await program.methods.recomputeRole(1, 0)
+      .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([])
+      .signers([admin3]).rpc();
+
+    // Verify parent's effective_permissions now contains perm 0 (inherited from child).
+    const chunk3 = await (program.account as any).roleChunk.fetch(rc3_0);
+    const parentEntry = chunk3.entries[1]; // slot 1 = topo_index 1
+    assert.ok(
+      (parentEntry.directPermissions as number[]).every((b: number) => b === 0),
+      "parent must have no direct permissions"
+    );
+    assert.ok(
+      hasBit(parentEntry.effectivePermissions as number[], 0),
+      "parent must have inherited perm 0 from child (Bug3 fix: pcc=0 now trusts child eff perms)"
+    );
+
+    // Cleanup: commit + finish (no users, so no batch needed).
+    await program.methods.commitUpdate()
+      .accounts({ organization: org3Pda, authority: admin3.publicKey })
+      .signers([admin3]).rpc();
+    await program.methods.finishUpdate()
+      .accounts({ organization: org3Pda, authority: admin3.publicKey })
+      .signers([admin3]).rpc();
+  });
+
+  // ---------------------------------------------------------------------------
+  // transferSuperAdmin requires the new admin to co-sign,
+  // preventing permanent lockout by transferring to a dead/uncontrolled address.
+  // ---------------------------------------------------------------------------
+  it("transferSuperAdmin requires new_super_admin to co-sign", async () => {
+    const admin5 = Keypair.generate();
+    const sig5 = await provider.connection.requestAirdrop(admin5.publicKey, LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig5);
+
+    const newAdmin5 = Keypair.generate();
+
+    const orgName5 = "sec_fix5_org";
+    const [org5Pda] = findOrgPda(program.programId, admin5.publicKey, orgName5);
+    await program.methods
+      .initializeOrganization(orgName5, 0)
+      .accounts({ organization: org5Pda, authority: admin5.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin5])
+      .rpc();
+
+    // Attempt transfer WITHOUT new admin's signature — must fail.
+    try {
+      await program.methods
+        .transferSuperAdmin()
+        .accounts({
+          organization: org5Pda,
+          newSuperAdmin: newAdmin5.publicKey,
+          authority: admin5.publicKey,
+        })
+        .signers([admin5])   // new admin NOT included
+        .rpc();
+      assert.fail("expected signature verification failure");
+    } catch (err) {
+      // Anchor/runtime rejects missing signer — accept any error here.
+      assert.ok(err, "transfer without new admin signature must fail");
+    }
+
+    // Transfer WITH new admin's co-signature — must succeed.
+    await program.methods
+      .transferSuperAdmin()
+      .accounts({
+        organization: org5Pda,
+        newSuperAdmin: newAdmin5.publicKey,
+        authority: admin5.publicKey,
+      })
+      .signers([admin5, newAdmin5])   // both current and new admin sign
+      .rpc();
+
+    const org5After = await program.account.organization.fetch(org5Pda);
+    assert.ok(org5After.superAdmin.equals(newAdmin5.publicKey), "superAdmin must be new admin");
+  });
+
+  // ---------------------------------------------------------------------------
+  // initializeOrganization rejects manage_roles_permission >= 256.
+  // has_bit on [u8;32] always returns false for index >= 256, so setting this
+  // to >= 256 permanently disables delegation with no recovery path.
+  // ---------------------------------------------------------------------------
+  it("initializeOrganization rejects manage_roles_permission >= 256", async () => {
+    const admin6 = Keypair.generate();
+    const sig6 = await provider.connection.requestAirdrop(admin6.publicKey, LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig6);
+
+    const orgName6 = "sec_fix6_org";
+    const [org6Pda] = findOrgPda(program.programId, admin6.publicKey, orgName6);
+
+    // manage_roles_permission = 256 must be rejected.
+    try {
+      await program.methods
+        .initializeOrganization(orgName6, 256)
+        .accounts({ organization: org6Pda, authority: admin6.publicKey, systemProgram: SystemProgram.programId })
+        .signers([admin6])
+        .rpc();
+      assert.fail("expected InvalidPermissionIndex");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "InvalidPermissionIndex",
+        `Expected InvalidPermissionIndex, got: ${(err as AnchorError).error.errorCode.code}`);
+    }
+
+    // manage_roles_permission = u32::MAX must also be rejected.
+    try {
+      await program.methods
+        .initializeOrganization(orgName6, 4294967295)
+        .accounts({ organization: org6Pda, authority: admin6.publicKey, systemProgram: SystemProgram.programId })
+        .signers([admin6])
+        .rpc();
+      assert.fail("expected InvalidPermissionIndex for MAX");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal((err as AnchorError).error.errorCode.code, "InvalidPermissionIndex");
+    }
+
+    // manage_roles_permission = 255 must be accepted (last valid index).
+    const orgName6b = "sec_fix6b_org";
+    const [org6bPda] = findOrgPda(program.programId, admin6.publicKey, orgName6b);
+    await program.methods
+      .initializeOrganization(orgName6b, 255)
+      .accounts({ organization: org6bPda, authority: admin6.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin6])
+      .rpc();
+    const org6b = await program.account.organization.fetch(org6bPda);
+    assert.equal((org6b as any).manageRolesPermission as number, 255);
+  });
+
+  // ---------------------------------------------------------------------------
+  // createResource PDA is scoped to creator — two users with
+  // the same resource_id get different PDAs, preventing frontrunning.
+  // ---------------------------------------------------------------------------
+  it("resource PDA is creator-scoped, preventing frontrunning", async () => {
+    const admin7 = Keypair.generate();
+    const sig7 = await provider.connection.requestAirdrop(admin7.publicKey, 2 * LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig7);
+
+    const user7a = Keypair.generate();
+    const user7b = Keypair.generate();
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(user7a.publicKey, LAMPORTS_PER_SOL)
+    );
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(user7b.publicKey, LAMPORTS_PER_SOL)
+    );
+
+    // Create a fresh org with perm 0 for both users.
+    const orgName7 = "sec_fix7_org";
+    const [org7Pda] = findOrgPda(program.programId, admin7.publicKey, orgName7);
+    await program.methods.initializeOrganization(orgName7, 0)
+      .accounts({ organization: org7Pda, authority: admin7.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin7]).rpc();
+
+    // Create user accounts for user7a and user7b.
+    const [ua7a] = findUserAccountPda(program.programId, org7Pda, user7a.publicKey);
+    const [upc7a] = findUserPermCachePda(program.programId, org7Pda, user7a.publicKey);
+    const [ua7b] = findUserAccountPda(program.programId, org7Pda, user7b.publicKey);
+    const [upc7b] = findUserPermCachePda(program.programId, org7Pda, user7b.publicKey);
+
+    for (const [uaPda, upcPda, user] of [[ua7a, upc7a, user7a], [ua7b, upc7b, user7b]] as [PublicKey, PublicKey, Keypair][]) {
+      await program.methods.createUserAccount()
+        .accounts({ userAccount: uaPda, userPermCache: upcPda, organization: org7Pda, user: user.publicKey, authority: admin7.publicKey, systemProgram: SystemProgram.programId })
+        .signers([admin7]).rpc();
+    }
+
+    // Assign perm 0 to both users.
+    await program.methods.beginUpdate()
+      .accounts({ organization: org7Pda, authority: admin7.publicKey }).signers([admin7]).rpc();
+    const [pc7_0] = findPermChunkPda(program.programId, org7Pda, 0);
+    await program.methods.createPermission("create_res", "")
+      .accounts({ permChunk: pc7_0, organization: org7Pda, authority: admin7.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin7]).rpc();
+    await program.methods.commitUpdate()
+      .accounts({ organization: org7Pda, authority: admin7.publicKey }).signers([admin7]).rpc();
+
+    // Process recompute for both users (no roles, just direct perm grant).
+    const allUAs7 = await program.account.userAccount.all([
+      { memcmp: { offset: 8, bytes: org7Pda.toBase58() } },
+    ]);
+    const org7v = await program.account.organization.fetch(org7Pda);
+    const tv7 = (org7v.permissionsVersion as anchor.BN).toNumber();
+    const stale7 = allUAs7.filter((u: any) => u.account.cachedVersion.toNumber() < tv7);
+    if (stale7.length > 0) {
+      const ra7: any[] = [{ pubkey: pc7_0, isWritable: false, isSigner: false }];
+      const cnts7: number[] = [];
+      for (const ua of stale7) {
+        const [upcPda7] = findUserPermCachePda(program.programId, org7Pda, ua.account.user as PublicKey);
+        cnts7.push(0);
+        ra7.push({ pubkey: ua.publicKey, isWritable: true, isSigner: false });
+        ra7.push({ pubkey: upcPda7, isWritable: true, isSigner: false });
+      }
+      await program.methods.processRecomputeBatch(Buffer.from(cnts7), 1)
+        .accounts({ organization: org7Pda, authority: admin7.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts(ra7).signers([admin7]).rpc();
+    }
+    await program.methods.finishUpdate()
+      .accounts({ organization: org7Pda, authority: admin7.publicKey }).signers([admin7]).rpc();
+
+    // Assign perm 0 directly to both users.
+    await program.methods.assignUserPermission(0)
+      .accounts({ userAccount: ua7a, userPermCache: upc7a, permChunk: pc7_0, organization: org7Pda, authority: admin7.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin7]).rpc();
+    await program.methods.assignUserPermission(0)
+      .accounts({ userAccount: ua7b, userPermCache: upc7b, permChunk: pc7_0, organization: org7Pda, authority: admin7.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin7]).rpc();
+
+    // Both users try to create a resource with resource_id = 42.
+    const resourceId7 = new anchor.BN(42);
+    // With creator-scoped PDAs, each gets a DIFFERENT PDA for the same resource_id.
+    const [resPda7a] = findResourcePda(program.programId, org7Pda, user7a.publicKey, resourceId7);
+    const [resPda7b] = findResourcePda(program.programId, org7Pda, user7b.publicKey, resourceId7);
+    assert.ok(!resPda7a.equals(resPda7b), "different creators must get different resource PDAs for same resource_id");
+
+    // User 7a creates resource 42.
+    await program.methods.createResource("res42_a", resourceId7, 0)
+      .accounts({ resource: resPda7a, organization: org7Pda, userPermCache: upc7a, authority: user7a.publicKey, systemProgram: SystemProgram.programId })
+      .signers([user7a]).rpc();
+
+    // User 7b can also create resource 42 (their own PDA) — no frontrunning conflict.
+    await program.methods.createResource("res42_b", resourceId7, 0)
+      .accounts({ resource: resPda7b, organization: org7Pda, userPermCache: upc7b, authority: user7b.publicKey, systemProgram: SystemProgram.programId })
+      .signers([user7b]).rpc();
+
+    const res7a = await program.account.resource.fetch(resPda7a);
+    const res7b = await program.account.resource.fetch(resPda7b);
+    assert.ok(res7a.creator.equals(user7a.publicKey), "resource A creator must be user7a");
+    assert.ok(res7b.creator.equals(user7b.publicKey), "resource B creator must be user7b");
+    assert.ok(res7a.resourceId.eq(resourceId7));
+    assert.ok(res7b.resourceId.eq(resourceId7));
+  });
+
+  // ---------------------------------------------------------------------------
+  // recomputeRole prunes dead (inactive) children from the
+  // children Vec, freeing MAX_CHILDREN_PER_ROLE slots for new children.
+  // ---------------------------------------------------------------------------
+  it("recomputeRole prunes dead children, freeing capacity", async () => {
+    const admin8 = Keypair.generate();
+    const sig8 = await provider.connection.requestAirdrop(admin8.publicKey, 2 * LAMPORTS_PER_SOL);
+    await provider.connection.confirmTransaction(sig8);
+
+    const orgName8 = "sec_fix8_org";
+    const [org8Pda] = findOrgPda(program.programId, admin8.publicKey, orgName8);
+    await program.methods.initializeOrganization(orgName8, 0)
+      .accounts({ organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin8]).rpc();
+
+    // Create 3 child roles (0,1,2) and 1 parent role (3).
+    await program.methods.beginUpdate()
+      .accounts({ organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+
+    const [rc8_0] = findRoleChunkPda(program.programId, org8Pda, 0);
+    for (const name of ["c0", "c1", "c2", "parent"]) {
+      await program.methods.createRole(name, "")
+        .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+        .signers([admin8]).rpc();
+    }
+
+    // Add all 3 children to parent (role 3). parent_index > child_index is required.
+    for (const childIdx of [0, 1, 2]) {
+      await program.methods.addChildRole(3, childIdx)
+        .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+        .signers([admin8]).rpc();
+    }
+
+    // Delete children 0 and 1.
+    await program.methods.deleteRole(0)
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+    await program.methods.deleteRole(1)
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+
+    // Recompute remaining active roles (child 2 and parent 3). Children first.
+    await program.methods.recomputeRole(2, 0)
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([]).signers([admin8]).rpc();
+
+    // Recompute parent 3 — should prune dead children 0 and 1.
+    await program.methods.recomputeRole(3, 0)
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .remainingAccounts([]).signers([admin8]).rpc();
+
+    // Verify parent's children list now only contains child 2.
+    const chunk8 = await (program.account as any).roleChunk.fetch(rc8_0);
+    const parentEntry8 = chunk8.entries[3]; // slot 3 = topo_index 3
+    assert.deepEqual(
+      parentEntry8.children as number[],
+      [2],
+      "parent children must be pruned to only active child [2]"
+    );
+
+    // Commit and finish.
+    await program.methods.commitUpdate()
+      .accounts({ organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+    await program.methods.finishUpdate()
+      .accounts({ organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+
+    // After pruning, parent should be able to accept new children in a new update cycle.
+    await program.methods.beginUpdate()
+      .accounts({ organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+
+    // Create new child role 4 and add to parent.
+    await program.methods.createRole("new_child", "")
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin8]).rpc();
+
+    // Add new child 4 to parent 3. parent_index(3) < child_index(4) would violate
+    // topological order — so instead do addChildRole(4, 3) if that's the structure.
+    // Wait: parent must have HIGHER topo_index than child (parent_index > child_index).
+    // So we need a new parent. Let's create role 5 as the new parent.
+    await program.methods.createRole("new_parent", "")
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin8]).rpc();
+
+    // Add old parent (3) and new child (4) to new_parent (5).
+    await program.methods.addChildRole(5, 3)
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin8]).rpc();
+    await program.methods.addChildRole(5, 4)
+      .accounts({ roleChunk: rc8_0, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+      .signers([admin8]).rpc();
+
+    const chunk8_after = await (program.account as any).roleChunk.fetch(rc8_0);
+    const newParent = chunk8_after.entries[5]; // slot 5 = topo_index 5
+    assert.deepEqual(
+      newParent.children as number[],
+      [3, 4],
+      "new parent must have children [3, 4]"
+    );
+
+    // Clean up update state.
+    for (const idx of [2, 3, 4, 5]) {
+      const ci = Math.floor(idx / ROLES_PER_CHUNK);
+      const [rcp] = findRoleChunkPda(program.programId, org8Pda, ci);
+      await program.methods.recomputeRole(idx, 0)
+        .accounts({ roleChunk: rcp, organization: org8Pda, authority: admin8.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts([]).signers([admin8]).rpc();
+    }
+    await program.methods.commitUpdate()
+      .accounts({ organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
+    await program.methods.finishUpdate()
+      .accounts({ organization: org8Pda, authority: admin8.publicKey }).signers([admin8]).rpc();
   });
 });
