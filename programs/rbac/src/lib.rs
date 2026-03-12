@@ -175,11 +175,8 @@ pub mod rbac {
         instructions::create_resource::handler(ctx, title, resource_id, required_permission)
     }
 
-    pub fn delete_resource(
-        ctx: Context<DeleteResource>,
-        required_permission: u32,
-    ) -> Result<()> {
-        instructions::delete_resource::handler(ctx, required_permission)
+    pub fn delete_resource(ctx: Context<DeleteResource>) -> Result<()> {
+        instructions::delete_resource::handler(ctx)
     }
 
     pub fn transfer_super_admin(ctx: Context<TransferSuperAdmin>) -> Result<()> {

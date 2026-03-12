@@ -5,7 +5,6 @@ use crate::state::*;
 
 /// Deletes a resource. The caller must have the specified permission.
 #[derive(Accounts)]
-#[instruction(required_permission: u32)]
 pub struct DeleteResource<'info> {
     #[account(
         mut,
@@ -50,9 +49,12 @@ pub struct DeleteResource<'info> {
     pub resource_creator: SystemAccount<'info>,
 }
 
-pub fn handler(ctx: Context<DeleteResource>, required_permission: u32) -> Result<()> {
+pub fn handler(ctx: Context<DeleteResource>) -> Result<()> {
     let cache = &ctx.accounts.user_perm_cache;
     let org = &ctx.accounts.organization;
+    // Use the permission index stored at creation time — the caller cannot
+    // self-select a weaker permission to bypass the access check.
+    let required_permission = ctx.accounts.resource.required_permission;
 
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
     require!(

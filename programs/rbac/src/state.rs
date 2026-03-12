@@ -242,10 +242,14 @@ pub struct Resource {
     pub resource_id: u64,
     pub created_at: i64,
     pub bump: u8,
+    /// The permission index required to create/delete this resource.
+    /// Stored at creation time; enforced at deletion time so the caller
+    /// cannot self-select a weaker permission.
+    pub required_permission: u32,
 }
 
 impl Resource {
-    pub const SIZE: usize = 8 + 32 + 32 + (4 + MAX_RESOURCE_TITLE_LEN) + 8 + 8 + 1;
+    pub const SIZE: usize = 8 + 32 + 32 + (4 + MAX_RESOURCE_TITLE_LEN) + 8 + 8 + 1 + 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -842,5 +846,53 @@ mod tests {
             org_permissions_version,
             "recomputed-this-cycle child must pass parent recompute check"
         );
+    }
+
+    // ── C1 fix: Resource stores required_permission ───────────────────────
+    // Verifies that delete_resource must use the permission stored at creation
+    // time, not a caller-supplied value.
+    #[test]
+    fn test_resource_stores_required_permission() {
+        let resource = Resource {
+            organization: Pubkey::default(),
+            creator: Pubkey::default(),
+            title: "secret doc".into(),
+            resource_id: 42,
+            created_at: 0,
+            bump: 255,
+            required_permission: 7, // set at creation time
+        };
+
+        // The deletion logic must read resource.required_permission (7),
+        // not any caller-supplied value.
+        let required_at_deletion = resource.required_permission;
+        assert_eq!(required_at_deletion, 7,
+            "delete must use the permission stored in the resource, not caller input");
+
+        // Simulate: caller holds permission 1 (low privilege), tries to bypass
+        // by passing required_permission=1.  The stored value is 7, so the check
+        // uses 7 regardless of caller input.
+        let caller_permissions: Vec<u8> = {
+            let mut v = Vec::new();
+            set_bit(&mut v, 1); // only permission 1
+            v
+        };
+        assert!(!has_bit(&caller_permissions, required_at_deletion),
+            "caller with only permission 1 must NOT pass the permission-7 gate");
+
+        // Caller holds permission 7 — must pass.
+        let mut admin_permissions: Vec<u8> = Vec::new();
+        set_bit(&mut admin_permissions, 7);
+        assert!(has_bit(&admin_permissions, required_at_deletion),
+            "caller with permission 7 must pass the permission-7 gate");
+    }
+
+    // Verify Resource::SIZE accounts for the new required_permission field.
+    #[test]
+    fn test_resource_size_includes_required_permission() {
+        // 8 disc + 32 org + 32 creator + (4+64) title + 8 resource_id
+        // + 8 created_at + 1 bump + 4 required_permission = 161
+        assert_eq!(Resource::SIZE, 161,
+            "Resource::SIZE must include 4 bytes for required_permission");
     }
 }

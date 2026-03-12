@@ -75,6 +75,7 @@ pub fn handler(
     resource.resource_id = resource_id;
     resource.created_at = Clock::get()?.unix_timestamp;
     resource.bump = ctx.bumps.resource;
+    resource.required_permission = required_permission;
 
     msg!(
         "Resource '{}' (id={}) created by {}",
