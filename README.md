@@ -57,12 +57,12 @@ Solana-rbac/
 
 | Account | PDA Seeds | Description |
 |---------|-----------|-------------|
-| `Organization` | `["organization", name]` | Root account; holds state machine, counters |
+| `Organization` | `["organization", original_admin, name]` | Root account; holds state machine, counters. Address stable across `transfer_super_admin`. |
 | `RoleChunk` | `["role_chunk", org, chunk_index_le4]` | Holds up to 16 `RoleEntry` structs |
 | `PermChunk` | `["perm_chunk", org, chunk_index_le4]` | Holds up to 32 `PermEntry` structs |
 | `UserAccount` | `["user_account", org, user]` | Assigned roles + permission bitmasks (dynamic size) |
 | `UserPermCache` | `["user_perm_cache", org, user]` | Fixed 145-byte hot-path cache, mirrored from UserAccount |
-| `Resource` | `["resource", org, resource_id_le8]` | Demo permission-gated resource |
+| `Resource` | `["resource", org, creator, resource_id_le8]` | Demo permission-gated resource; one per (org, creator, resource_id) |
 
 ### Chunk index arithmetic
 
@@ -95,10 +95,11 @@ Idle ──(begin_update)──► Updating ──(commit_update)──► Recom
 
 | Instruction | Auth | Notes |
 |-------------|------|-------|
-| `initialize_organization(name)` | Anyone | Caller becomes `super_admin` |
+| `initialize_organization(name, manage_roles_permission)` | Anyone | Caller becomes `super_admin`; `manage_roles_permission` is the permission index that allows assign/revoke roles |
 | `begin_update` | super_admin | Idle → Updating |
 | `commit_update` | super_admin | Updating → Recomputing, bumps version |
 | `finish_update` | super_admin | Recomputing → Idle |
+| `transfer_super_admin` | super_admin | Transfers super_admin to another signer (new admin must sign). Org PDA address unchanged (uses `original_admin`). |
 
 ### Permissions (Updating state)
 
@@ -126,8 +127,8 @@ Idle ──(begin_update)──► Updating ──(commit_update)──► Recom
 | Instruction | Auth |
 |-------------|------|
 | `create_user_account` | super_admin |
-| `assign_role(role_index)` | super_admin or holder of permission index `3` |
-| `revoke_role(role_index, perm_chunk_count)` | super_admin or holder of permission index `3` |
+| `assign_role(role_index, perm_chunk_count)` | super_admin or holder of org’s `manage_roles_permission` |
+| `revoke_role(role_index, perm_chunk_count)` | super_admin or holder of org’s `manage_roles_permission` |
 | `assign_user_permission(permission_index)` | super_admin |
 | `revoke_user_permission(permission_index, perm_chunk_count)` | super_admin |
 
@@ -136,15 +137,15 @@ Idle ──(begin_update)──► Updating ──(commit_update)──► Recom
 | Instruction | State | Notes |
 |-------------|-------|-------|
 | `process_recompute_batch(user_chunk_counts, perm_chunk_count)` | Recomputing | Refreshes multiple user caches in one TX via `remaining_accounts` |
-| `has_permission(permission_index)` | Any | O(1) bitmask check; emits `AccessVerified`; usable via CPI |
-| `has_role(role_index)` | Any | Scans `assigned_roles` Vec; usable via CPI |
+| `has_permission(permission_index)` | Any | O(1) bitmask check on `UserPermCache`; emits `AccessVerified`; usable via CPI |
+| `has_role(role_index)` | Any | O(1) bitmask check on `UserPermCache.effective_roles`; usable via CPI |
 
 ### Demo Resources
 
 | Instruction | Notes |
 |-------------|-------|
-| `create_resource(title, resource_id, required_permission)` | Checks caller's `UserPermCache` |
-| `delete_resource(required_permission)` | Closes `Resource` PDA, refunds rent |
+| `create_resource(title, resource_id, required_permission)` | Checks caller's `UserPermCache`; stores `required_permission` on resource |
+| `delete_resource` | Caller must have the permission stored on the resource; closes `Resource` PDA, refunds rent to creator |
 
 ---
 
@@ -159,7 +160,7 @@ Byte 1 = indices 8–15
 Byte k, bit b = index k*8 + b
 ```
 
-**Reserved index:** `3` = `MANAGE_ROLES` — holders can assign/revoke roles on behalf of super_admin.
+**Manage-roles permission:** Set per-org at `initialize_organization(name, manage_roles_permission)`. Holders of that index can assign/revoke roles (delegation). Convention is often index `3` (`MANAGE_ROLES`).
 
 **Maximum:** 256 permissions per organisation (32-byte fixed cache).
 
@@ -244,8 +245,8 @@ pub fn my_instruction(ctx: Context<MyCtx>) -> Result<()> {
     let cpi_program = ctx.accounts.rbac_program.to_account_info();
     let cpi_accounts = rbac::cpi::accounts::HasPermission {
         organization: ctx.accounts.organization.to_account_info(),
-        user_account: ctx.accounts.user_account.to_account_info(),
         user: ctx.accounts.user.to_account_info(),
+        user_perm_cache: ctx.accounts.user_perm_cache.to_account_info(),
     };
     rbac::cpi::has_permission(
         CpiContext::new(cpi_program, cpi_accounts),
@@ -260,11 +261,12 @@ If the user lacks the permission or their cache is stale, the CPI returns an err
 
 ---
 
-## Architecture
+## Documentation
 
-Detailed Mermaid diagrams covering account data model, state machine, instruction flows, authorization matrix, role hierarchy, and CPI integration:
-
-**[docs/architecture.md](docs/architecture.md)**
+| Doc | Description |
+|-----|-------------|
+| **[Architecture](docs/architecture.md)** | Mermaid diagrams: account model, state machine, instruction flows, auth matrix, CPI integration. |
+| **[Security](SECURITY.md)** | Supported versions and how to report vulnerabilities. |
 
 ---
 

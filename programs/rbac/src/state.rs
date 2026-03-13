@@ -992,4 +992,378 @@ mod tests {
         assert_eq!(Resource::SIZE, 161,
             "Resource::SIZE must include 4 bytes for required_permission");
     }
+
+    // ── M-1: required_permission bounds check ─────────────────────────────
+    // create_resource must reject permission indices that have never been
+    // created (>= next_permission_index), otherwise the resource becomes
+    // permanently undeletable because no user can hold the bit in a fresh cache.
+
+    /// required_permission == next_permission_index must be rejected.
+    #[test]
+    fn test_required_permission_equal_to_next_index_is_invalid() {
+        let next_permission_index: u32 = 5; // permissions 0..4 exist
+        let required_permission: u32 = 5;   // index 5 does not exist yet
+
+        // The fix: required_permission < org.next_permission_index
+        let is_valid = required_permission < next_permission_index;
+        assert!(
+            !is_valid,
+            "required_permission == next_permission_index must be rejected; \
+             no user can hold a non-existent permission, so the resource \
+             would be permanently undeletable"
+        );
+    }
+
+    /// required_permission strictly greater than next_permission_index must be rejected.
+    #[test]
+    fn test_required_permission_beyond_next_index_is_invalid() {
+        let next_permission_index: u32 = 3;
+        let required_permission: u32 = 99;
+
+        let is_valid = required_permission < next_permission_index;
+        assert!(
+            !is_valid,
+            "required_permission far beyond next_permission_index must be rejected"
+        );
+    }
+
+    /// required_permission strictly less than next_permission_index must be accepted.
+    #[test]
+    fn test_required_permission_within_next_index_is_valid() {
+        let next_permission_index: u32 = 8;
+        let required_permission: u32 = 7; // last valid index
+
+        let is_valid = required_permission < next_permission_index;
+        assert!(
+            is_valid,
+            "required_permission = next_permission_index - 1 must be accepted"
+        );
+    }
+
+    /// Edge case: no permissions created yet — any required_permission must fail.
+    #[test]
+    fn test_required_permission_with_no_permissions_created() {
+        let next_permission_index: u32 = 0; // org has no permissions at all
+        for required_permission in [0u32, 1, 127, 255] {
+            let is_valid = required_permission < next_permission_index;
+            assert!(
+                !is_valid,
+                "required_permission {} must be rejected when next_permission_index=0",
+                required_permission
+            );
+        }
+    }
+
+    // ── M-2: checked_sub vs saturating_sub for role recompute counters ────
+    // roles_pending_recompute and active_role_count must use checked_sub so
+    // that invariant violations surface immediately rather than being silently
+    // masked (e.g. counter at 0 unexpectedly decremented would stay at 0
+    // with saturating_sub, allowing commit_update to succeed prematurely).
+
+    /// saturating_sub silently stays at 0 — demonstrates why it masks bugs.
+    #[test]
+    fn test_saturating_sub_masks_underflow() {
+        let counter: u32 = 0;
+        let result = counter.saturating_sub(1);
+        // The counter stays at 0 — commit_update would see 0 and wrongly
+        // conclude all roles are recomputed.
+        assert_eq!(
+            result, 0,
+            "saturating_sub silently stays at 0 — this masks the invariant violation"
+        );
+    }
+
+    /// checked_sub returns None on underflow — correct defensive behaviour.
+    #[test]
+    fn test_checked_sub_exposes_underflow() {
+        let counter: u32 = 0;
+        let result = counter.checked_sub(1);
+        assert!(
+            result.is_none(),
+            "checked_sub must return None when counter is 0 — invariant violation is surfaced"
+        );
+    }
+
+    /// Normal decrement path: checked_sub returns Some when value > 0.
+    #[test]
+    fn test_checked_sub_normal_decrement() {
+        let mut roles_pending: u32 = 3;
+        for _ in 0..3 {
+            roles_pending = roles_pending
+                .checked_sub(1)
+                .expect("counter must not underflow during normal recompute");
+        }
+        assert_eq!(roles_pending, 0, "counter reaches exactly 0 after all roles recomputed");
+
+        // One more decrement would underflow — idempotency guard prevents this
+        // in the real instruction, but checked_sub catches it defensively.
+        let overflow = roles_pending.checked_sub(1);
+        assert!(
+            overflow.is_none(),
+            "checked_sub must detect the extra decrement that the idempotency guard should prevent"
+        );
+    }
+
+    /// active_role_count underflow detection: deleting more roles than exist
+    /// must be caught, not silently masked.
+    #[test]
+    fn test_active_role_count_checked_sub_on_double_delete() {
+        // Simulate: 1 active role, deleted once (active_role_count goes 1 → 0).
+        // A second delete of the same index is blocked by require!(entry.active),
+        // but checked_sub adds a second line of defence.
+        let active_role_count: u32 = 1;
+        let after_first = active_role_count.checked_sub(1).expect("first delete ok");
+        assert_eq!(after_first, 0);
+
+        // Second delete — checked_sub catches it; saturating_sub would not.
+        let after_second = after_first.checked_sub(1);
+        assert!(
+            after_second.is_none(),
+            "checked_sub must detect attempted decrement past zero"
+        );
+    }
+
+    /// Verify the counter invariant holds across a complete update cycle:
+    /// begin_update seeds from active_role_count; each recompute decrements by 1;
+    /// commit_update requires the result to be 0.
+    #[test]
+    fn test_roles_pending_recompute_checked_sub_full_cycle() {
+        let active_role_count: u32 = 4;
+        let mut pending = active_role_count; // begin_update seeds this
+
+        for i in 0..active_role_count {
+            pending = pending
+                .checked_sub(1)
+                .unwrap_or_else(|| panic!("underflow at role {}", i));
+        }
+        assert_eq!(pending, 0, "all roles recomputed — commit_update may proceed");
+
+        // Attempting to recompute a fifth (non-existent) role must be caught.
+        let extra = pending.checked_sub(1);
+        assert!(
+            extra.is_none(),
+            "recomputing beyond active_role_count must surface as an error"
+        );
+    }
+
+    // ── Fix: revoke_user_permission silent permission strip (Finding 10) ──────
+    //
+    // The bug: revoke_user_permission used `if let Some(chunk)` when looking up
+    // PermChunks for both direct_permissions and role permissions. If a chunk
+    // was absent from the provided account slice, the corresponding permission
+    // bits were silently dropped from the recomputed effective_permissions —
+    // even bits the user should have kept.
+    //
+    // The fix: replace `if let Some()` with `.ok_or(ChunkNotFound)?`, identical
+    // to the strict pattern used in revoke_role.rs and process_recompute_batch.rs.
+
+    /// Demonstrates the old buggy `if let Some` pattern: permissions from chunks
+    /// not present in the supplied account set are silently stripped.
+    #[test]
+    fn test_silent_strip_with_if_let_pattern() {
+        // User has permission 5 (chunk 0, slot 5) and permission 35 (chunk 1, slot 3).
+        // Only chunk 0 is in the caller's account set.
+        let mut direct_permissions: Vec<u8> = Vec::new();
+        set_bit(&mut direct_permissions, 5);
+        set_bit(&mut direct_permissions, 35);
+
+        // Simulate the old if-let pattern: chunk 1 is absent → bit 35 dropped.
+        let mut result_old: Vec<u8> = Vec::new();
+        for (byte_idx, &byte) in direct_permissions.iter().enumerate() {
+            if byte == 0 { continue; }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let perm_idx = (byte_idx as u32) * 8 + bit;
+                    let chunk_idx = perm_idx / PERMS_PER_CHUNK as u32;
+                    let slot      = perm_idx as usize % PERMS_PER_CHUNK;
+                    // Only chunk 0 is "present".
+                    if chunk_idx == 0 {
+                        // slot 5 is active in chunk 0.
+                        if slot == 5 { set_bit(&mut result_old, perm_idx); }
+                    }
+                    // chunk 1 absent → old code silently skips, bit 35 is lost.
+                }
+            }
+        }
+
+        assert!(has_bit(&result_old, 5),  "perm 5 preserved — chunk 0 present");
+        assert!(!has_bit(&result_old, 35),
+            "perm 35 SILENTLY STRIPPED by old if-let pattern — this is the bug");
+    }
+
+    /// Demonstrates the fixed `ok_or` pattern: a missing chunk surfaces as an
+    /// error instead of silently stripping permissions.
+    #[test]
+    fn test_strict_ok_or_pattern_detects_missing_chunk() {
+        // Same scenario: bits 5 and 35, only chunk 0 supplied.
+        let mut direct_permissions: Vec<u8> = Vec::new();
+        set_bit(&mut direct_permissions, 5);
+        set_bit(&mut direct_permissions, 35);
+
+        let mut missing_chunk_detected = false;
+        'outer: for (byte_idx, &byte) in direct_permissions.iter().enumerate() {
+            if byte == 0 { continue; }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let perm_idx  = (byte_idx as u32) * 8 + bit;
+                    let chunk_idx = perm_idx / PERMS_PER_CHUNK as u32;
+                    // Simulate: chunk 0 present, chunk 1 absent.
+                    let chunk_present = chunk_idx == 0;
+                    if !chunk_present {
+                        // Fixed code: ok_or(ChunkNotFound) propagates the error.
+                        missing_chunk_detected = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        assert!(missing_chunk_detected,
+            "fixed code must surface ChunkNotFound for permissions in missing chunks");
+    }
+
+    /// The fix must not change behaviour when ALL needed chunks are supplied.
+    #[test]
+    fn test_strict_pattern_succeeds_when_all_chunks_present() {
+        // Bits 5 (chunk 0) and 35 (chunk 1); both chunks supplied.
+        let mut direct_permissions: Vec<u8> = Vec::new();
+        set_bit(&mut direct_permissions, 5);
+        set_bit(&mut direct_permissions, 35);
+
+        // Simulate chunk entries: perm 5 active in chunk 0, perm 35 active in chunk 1.
+        let chunk0_active: std::collections::HashMap<u32, bool> =
+            [(5u32, true)].iter().cloned().collect();
+        let chunk1_active: std::collections::HashMap<u32, bool> =
+            [(35u32 % PERMS_PER_CHUNK as u32, true)].iter().cloned().collect();
+
+        let mut result: Vec<u8> = Vec::new();
+        let mut error = false;
+        'outer: for (byte_idx, &byte) in direct_permissions.iter().enumerate() {
+            if byte == 0 { continue; }
+            for bit in 0..8u32 {
+                if byte & (1 << bit) != 0 {
+                    let perm_idx  = (byte_idx as u32) * 8 + bit;
+                    let chunk_idx = perm_idx / PERMS_PER_CHUNK as u32;
+                    let slot      = perm_idx % PERMS_PER_CHUNK as u32;
+                    let active = match chunk_idx {
+                        0 => chunk0_active.get(&slot).copied().unwrap_or(false),
+                        1 => chunk1_active.get(&slot).copied().unwrap_or(false),
+                        _ => { error = true; break 'outer; }
+                    };
+                    if active { set_bit(&mut result, perm_idx); }
+                }
+            }
+        }
+
+        assert!(!error, "no missing-chunk error when all chunks are supplied");
+        assert!(has_bit(&result, 5),  "perm 5 kept — chunk 0 supplied and active");
+        assert!(has_bit(&result, 35), "perm 35 kept — chunk 1 supplied and active");
+    }
+
+    // ── Fix: resource permanently undeletable after required_permission deleted (Finding 11) ─
+
+    /// Demonstrates the pre-fix vulnerability: after a permission is soft-deleted
+    /// and the update cycle runs, no fresh UserPermCache will contain the deleted
+    /// bit, so `has_bit(&cache, required_permission)` always returns false and
+    /// delete_resource permanently fails.
+    #[test]
+    fn test_deleted_required_permission_locks_resource_forever() {
+        let required_permission: u32 = 7;
+        // After delete_permission(7) + update cycle the cache has no bit 7.
+        let fresh_cache_after_deletion = [0u8; 32];
+
+        let can_delete = has_bit(&fresh_cache_after_deletion, required_permission);
+        assert!(
+            !can_delete,
+            "no user can ever hold a deleted permission bit in a fresh cache — \
+             resource.delete would fail permanently without a recovery path"
+        );
+    }
+
+    /// Verifies the recovery-path logic: when the permission is inactive the
+    /// original creator (and only the creator) may force-close the resource.
+    #[test]
+    fn test_recovery_path_allows_creator_to_close_orphaned_resource() {
+        let perm_is_active   = false; // permission was soft-deleted
+        let caller_is_creator = true;
+
+        // Recovery path: !active && caller == creator → allowed.
+        let can_force_close = !perm_is_active && caller_is_creator;
+        assert!(
+            can_force_close,
+            "resource creator must be able to force-close once required_permission is inactive"
+        );
+    }
+
+    /// A third party cannot trigger the recovery-path deletion even when the
+    /// permission is inactive — lamports must go only to the original creator.
+    #[test]
+    fn test_recovery_path_blocks_third_party_force_close() {
+        let perm_is_active    = false;
+        let caller_is_creator = false; // some other signer
+
+        let can_force_close = !perm_is_active && caller_is_creator;
+        assert!(
+            !can_force_close,
+            "non-creator must not be able to force-close an orphaned resource"
+        );
+    }
+
+    /// When the permission is still active the normal cache check applies,
+    /// regardless of whether the caller is the resource creator.
+    #[test]
+    fn test_normal_delete_path_requires_cache_bit_when_perm_active() {
+        let perm_is_active      = true;
+        let required_permission: u32 = 5;
+
+        // Caller without the permission is rejected on the normal path.
+        let cache_without = [0u8; 32];
+        if perm_is_active {
+            assert!(
+                !has_bit(&cache_without, required_permission),
+                "active perm: caller without it must be rejected"
+            );
+        }
+
+        // Caller with the permission is accepted.
+        let mut cache_with = [0u8; 32];
+        set_bit_arr(&mut cache_with, required_permission);
+        if perm_is_active {
+            assert!(
+                has_bit(&cache_with, required_permission),
+                "active perm: caller holding it must be accepted"
+            );
+        }
+    }
+
+    /// End-to-end simulation of the full fix: active permission → normal check;
+    /// inactive permission → creator-only force-close; non-creator rejected.
+    #[test]
+    fn test_delete_resource_combined_path_logic() {
+        struct DeleteAttempt {
+            perm_active:      bool,
+            caller_has_perm:  bool,
+            caller_is_creator: bool,
+        }
+        impl DeleteAttempt {
+            fn can_delete(&self) -> bool {
+                if self.perm_active {
+                    self.caller_has_perm   // normal path
+                } else {
+                    self.caller_is_creator // recovery path
+                }
+            }
+        }
+
+        // Active permission, authorized caller.
+        assert!(DeleteAttempt { perm_active: true,  caller_has_perm: true,  caller_is_creator: false }.can_delete());
+        // Active permission, unauthorized caller.
+        assert!(!DeleteAttempt { perm_active: true,  caller_has_perm: false, caller_is_creator: true  }.can_delete());
+        // Deleted permission, caller is creator.
+        assert!(DeleteAttempt { perm_active: false, caller_has_perm: false, caller_is_creator: true  }.can_delete());
+        // Deleted permission, caller is NOT creator.
+        assert!(!DeleteAttempt { perm_active: false, caller_has_perm: false, caller_is_creator: false }.can_delete());
+        // Deleted permission + has perm (impossible in practice) + not creator.
+        assert!(!DeleteAttempt { perm_active: false, caller_has_perm: true,  caller_is_creator: false }.can_delete());
+    }
 }

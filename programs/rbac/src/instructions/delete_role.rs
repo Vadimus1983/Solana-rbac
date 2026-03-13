@@ -56,13 +56,25 @@ pub fn handler(ctx: Context<DeleteRole>, role_index: u32) -> Result<()> {
 
     // Keep active_role_count in sync so begin_update can seed
     // roles_pending_recompute with the correct number of live roles.
-    ctx.accounts.organization.active_role_count =
-        ctx.accounts.organization.active_role_count.saturating_sub(1);
+    // Use checked_sub: require!(entry.active) above guarantees this role was
+    // counted, so underflow would indicate a state machine invariant violation.
+    ctx.accounts.organization.active_role_count = ctx
+        .accounts
+        .organization
+        .active_role_count
+        .checked_sub(1)
+        .ok_or(error!(RbacError::RoleCountOverflow))?;
     // Release the pending-recompute slot so the update cycle can still close
     // when a role is deleted before being recomputed this cycle.
+    // Use checked_sub: the counter was seeded from active_role_count and
+    // decremented at most once per active role, so underflow is a logic bug.
     if !already_recomputed_this_cycle {
-        ctx.accounts.organization.roles_pending_recompute =
-            ctx.accounts.organization.roles_pending_recompute.saturating_sub(1);
+        ctx.accounts.organization.roles_pending_recompute = ctx
+            .accounts
+            .organization
+            .roles_pending_recompute
+            .checked_sub(1)
+            .ok_or(error!(RbacError::UpdateIncomplete))?;
     }
 
     emit!(RoleDeleted {

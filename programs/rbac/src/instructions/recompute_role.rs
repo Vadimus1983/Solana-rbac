@@ -256,7 +256,10 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         + ((new_children_count as isize - old_children_count as isize) * 4);
 
     let current_len = ctx.accounts.role_chunk.to_account_info().data_len();
-    let new_space = (current_len as isize + delta) as usize;
+    let new_space_isize = current_len as isize + delta;
+    // Prevent underflow: (current_len + delta) must not be negative when cast to usize.
+    require!(new_space_isize >= 0, RbacError::RoleSlotEmpty);
+    let new_space = new_space_isize as usize;
     if delta > 0 {
         let rent = Rent::get()?;
         let new_min = rent.minimum_balance(new_space);
@@ -295,8 +298,14 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
 
     // Decrement the recompute counter so commit_update can enforce that all
     // active roles were processed before closing the update cycle.
+    // Use checked_sub to surface any invariant violation instead of silently
+    // masking it: the idempotency guard above prevents double-decrement, so
+    // underflow here would indicate a logic bug in the state machine.
     let org = &mut ctx.accounts.organization;
-    org.roles_pending_recompute = org.roles_pending_recompute.saturating_sub(1);
+    org.roles_pending_recompute = org
+        .roles_pending_recompute
+        .checked_sub(1)
+        .ok_or(error!(RbacError::UpdateIncomplete))?;
 
     msg!("Role index {} effective_permissions recomputed ({} roles remaining)", role_index, org.roles_pending_recompute);
     Ok(())

@@ -60,6 +60,14 @@ pub fn handler(
     let cache = &ctx.accounts.user_perm_cache;
     let org = &ctx.accounts.organization;
 
+    // Reject permission indices that have never been created — no user can
+    // ever hold such a bit in a fresh cache, so the resource would be
+    // permanently undeletable (lamports locked forever).
+    require!(
+        required_permission < org.next_permission_index,
+        RbacError::InvalidPermissionIndex
+    );
+
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
     require!(
         cache.permissions_version >= org.permissions_version,

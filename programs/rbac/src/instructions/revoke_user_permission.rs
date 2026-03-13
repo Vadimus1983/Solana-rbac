@@ -99,18 +99,21 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32, perm_c
                 let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
                 let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
                 if pcc > 0 {
-                    if let Some(perm_chunk) =
-                        perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
+                    // Use ok_or (not if-let-Some) so that a missing PermChunk
+                    // returns ChunkNotFound rather than silently stripping the
+                    // user's permissions from unrepresented chunks — consistent
+                    // with revoke_role.rs and process_recompute_batch.rs.
+                    let perm_chunk = perm_index
+                        .as_ref()
+                        .and_then(|idx| idx.get(&perm_chunk_idx))
+                        .ok_or(RbacError::ChunkNotFound)?;
+                    if perm_slot < perm_chunk.entries.len()
+                        && perm_chunk.entries[perm_slot].index == perm_index_val
+                        && perm_chunk.entries[perm_slot].active
                     {
-                        if perm_slot < perm_chunk.entries.len()
-                            && perm_chunk.entries[perm_slot].index == perm_index_val
-                            && perm_chunk.entries[perm_slot].active
-                        {
-                            set_bit(&mut result, perm_index_val);
-                        }
-                        // inactive or not in entries → bit silently dropped
+                        set_bit(&mut result, perm_index_val);
                     }
-                    // chunk not in accounts → treat as inactive, drop bit
+                    // inactive or not in entries → bit was soft-deleted, silently dropped
                 } else {
                     // pcc == 0: no perm chunks supplied — include bit as-is.
                     set_bit(&mut result, perm_index_val);
@@ -145,18 +148,19 @@ pub fn handler(ctx: Context<RevokeUserPermission>, permission_index: u32, perm_c
                         if pcc > 0 {
                             let perm_chunk_idx = perm_index_val / PERMS_PER_CHUNK as u32;
                             let perm_slot = perm_index_val as usize % PERMS_PER_CHUNK;
-                            if let Some(perm_chunk) =
-                                perm_index.as_ref().and_then(|idx| idx.get(&perm_chunk_idx))
+                            // Same strict pattern as the direct_permissions loop above:
+                            // fail fast if the required chunk was not supplied.
+                            let perm_chunk = perm_index
+                                .as_ref()
+                                .and_then(|idx| idx.get(&perm_chunk_idx))
+                                .ok_or(RbacError::ChunkNotFound)?;
+                            if perm_slot < perm_chunk.entries.len()
+                                && perm_chunk.entries[perm_slot].index == perm_index_val
+                                && perm_chunk.entries[perm_slot].active
                             {
-                                if perm_slot < perm_chunk.entries.len()
-                                    && perm_chunk.entries[perm_slot].index == perm_index_val
-                                    && perm_chunk.entries[perm_slot].active
-                                {
-                                    set_bit(&mut result, perm_index_val);
-                                }
-                                // inactive or not in entries → bit silently dropped
+                                set_bit(&mut result, perm_index_val);
                             }
-                            // chunk not in accounts → treat permission as inactive, drop bit
+                            // inactive or not in entries → bit was soft-deleted, silently dropped
                         } else {
                             set_bit(&mut result, perm_index_val);
                         }

@@ -1,9 +1,5 @@
 # Solana RBAC — Architecture & Instruction Flows
 
-> All diagrams use [Mermaid](https://mermaid.js.org/) syntax.
-> Render in VS Code with the **Markdown Preview Mermaid Support** extension,
-> or view on GitHub which renders Mermaid natively.
-
 ---
 
 ## Table of Contents
@@ -34,6 +30,8 @@
 14. [Role Tree — Implemented (Children-First DAG)](#14-role-tree--implemented-children-first-dag)
 15. [RoleRef — Per-Role Staleness Tracking](#15-roleref--per-role-staleness-tracking)
 16. [Future Improvements](#16-future-improvements)
+   - 16.1 [Batch size and compute limits](#161-batch-size-and-compute-limits)
+   - 16.2 [Program upgrade authority](#162-program-upgrade-authority)
 
 ---
 
@@ -59,6 +57,7 @@ graph TB
             IX --> HP[has_permission]
             IX --> CRes[create_resource]
             IX --> DRes[delete_resource]
+            IX --> TSA[transfer_super_admin]
             IX --> PRB[process_recompute_batch]
         end
 
@@ -114,12 +113,18 @@ erDiagram
 
     Organization {
         Pubkey super_admin
+        Pubkey original_admin
         String name
-        u32 role_count
+        u64 member_count
         u32 next_permission_index
+        u32 role_count
+        u32 active_role_count
         u64 permissions_version
         OrgState state
         u8 bump
+        u32 roles_pending_recompute
+        u32 users_pending_recompute
+        u32 manage_roles_permission
     }
 
     RoleChunk {
@@ -186,6 +191,7 @@ erDiagram
         u64 resource_id
         i64 created_at
         u8 bump
+        u32 required_permission
     }
 ```
 
@@ -212,7 +218,7 @@ graph LR
     SA([SuperAdmin Wallet])
     UW([User Wallet])
 
-    subgraph OrgNode["Organization PDA · seeds: 'organization' + name"]
+    subgraph OrgNode["Organization PDA · seeds: 'organization' + original_admin + name"]
         Org["super_admin: Pubkey<br/>name: String&lt;=32<br/>role_count: u32 · next_permission_index: u32<br/>permissions_version: u64<br/>state: Idle / Updating / Recomputing<br/>bump: u8"]
     end
 
@@ -232,8 +238,8 @@ graph LR
         RR["── RoleRef  embedded in UserAccount ──<br/>topo_index: u32<br/>last_seen_version: u64"]
     end
 
-    subgraph Resources["Resource PDAs · seeds: 'resource' + org + resource_id_le8"]
-        Res["organization: Pubkey · creator: Pubkey<br/>title: String&lt;=64 · resource_id: u64<br/>created_at: i64 · bump: u8"]
+    subgraph Resources["Resource PDAs · seeds: 'resource' + org + creator + resource_id_le8"]
+        Res["organization: Pubkey · creator: Pubkey<br/>title: String&lt;=64 · resource_id: u64<br/>created_at: i64 · bump: u8 · required_permission: u32"]
     end
 
     %% Pubkey FK references (stored as Pubkey inside the account data)
@@ -315,12 +321,12 @@ graph LR
 ```mermaid
 graph LR
     subgraph Seeds
-        S1["'organization' + name"]
+        S1["'organization' + original_admin + name"]
         S2["'role_chunk' + org_key + chunk_index_le4"]
         S3["'perm_chunk' + org_key + chunk_index_le4"]
         S4["'user_account' + org_key + user_key"]
         S5["'user_perm_cache' + org_key + user_key"]
-        S6["'resource' + org_key + resource_id_le8"]
+        S6["'resource' + org_key + creator_key + resource_id_le8"]
     end
 
     S1 -->|findProgramAddress| OrgPDA[Organization PDA]
@@ -585,12 +591,12 @@ sequenceDiagram
 sequenceDiagram
     actor Caller as Any Caller / CPI
     participant P as RBAC Program
-    participant UA as UserAccount
+    participant UPC as UserPermCache
 
     Caller->>P: has_permission(permission_index: 2)
 
-    P->>UA: Read effective_permissions bitmask
-    P->>P: Verify cached_version >= org.permissions_version
+    P->>UPC: Read effective_permissions bitmask
+    P->>P: Verify permissions_version >= org.permissions_version
     P->>P: Check: has_bit(effective_permissions, 2)
 
     alt Permission bit NOT set or stale
@@ -600,7 +606,7 @@ sequenceDiagram
     P->>P: emit!(AccessVerified { has_access: true })
     P-->>Caller: OK ✓
 
-    Note over Caller,UA: effective_permissions is always fresh after<br/>assign_role / revoke_role (inline recompute)<br/>or process_recompute_batch
+    Note over Caller,UPC: effective_permissions is always fresh after<br/>assign_role / revoke_role (inline recompute)<br/>or process_recompute_batch
 ```
 
 ### 5.8 has_role
@@ -609,21 +615,22 @@ sequenceDiagram
 sequenceDiagram
     actor Caller as Any Caller / CPI
     participant P as RBAC Program
-    participant UA as UserAccount
+    participant UPC as UserPermCache
 
     Caller->>P: has_role(role_index: 3)
 
-    P->>UA: Scan assigned_roles Vec<RoleRef>
-    P->>P: any(|r| r.topo_index == 3)?
+    P->>UPC: Read effective_roles bitmask (O(1))
+    P->>P: Verify permissions_version >= org.permissions_version
+    P->>P: Check: has_bit(effective_roles, 3)
 
-    alt Not found
-        P-->>Caller: ERROR: RoleNotAssigned
+    alt Bit NOT set or stale
+        P-->>Caller: ERROR: RoleNotAssigned or StalePermissions
     end
 
     P->>P: emit!(AccessVerified { has_access: true })
     P-->>Caller: OK ✓
 
-    Note over UA: No Role PDA lookup needed<br/>Membership stored in UserAccount
+    Note over UPC: O(1) bitmask — no Vec scan.<br/>Uses UserPermCache, not UserAccount.
 ```
 
 ### 5.9 create_resource / delete_resource
@@ -632,19 +639,19 @@ sequenceDiagram
 sequenceDiagram
     actor User as User Wallet
     participant P as RBAC Program
-    participant UA as UserAccount
+    participant UPC as UserPermCache
     participant Res as Resource PDA
 
     User->>P: create_resource(title, resource_id, required_permission: 1)
 
-    P->>UA: Check: has_bit(effective_permissions, 1)
-    P->>P: Verify: cached_version >= org.permissions_version
+    P->>UPC: Check: has_bit(effective_permissions, 1)
+    P->>P: Verify: permissions_version >= org.permissions_version
 
     alt Missing permission or stale
         P-->>User: ERROR: InsufficientPermission / StalePermissions
     end
 
-    P->>Res: Create PDA ["resource", org, resource_id_le8]
+    P->>Res: Create PDA ["resource", org, creator, resource_id_le8]
     P->>Res: Set organization, creator, title, resource_id, required_permission
     P-->>User: OK ✓
 ```
@@ -662,8 +669,8 @@ graph TB
     Q -->|"Off-chain, 1 RPC call"| C
 
     subgraph free1["FREE - Off-Chain, 1 RPC call"]
-        C["getAccountInfo: UserAccount PDA"]
-        C --> C1["Deserialize effective_permissions bitmask"]
+        C["getAccountInfo: UserPermCache PDA (145 bytes)"]
+        C --> C1["Read effective_permissions bitmask"]
         C1 --> C2["has_bit(effective_permissions, index)"]
         C2 --> C3["Return: true or false"]
     end
@@ -679,8 +686,8 @@ graph TB
 
     subgraph cpi["5000 lamports - CPI"]
         B["CPI: invoke has_permission"]
-        B --> B1["Pass org, user, user_account"]
-        B1 --> B2["RBAC checks bitmask and cached_version"]
+        B --> B1["Pass org, user, user_perm_cache"]
+        B1 --> B2["RBAC checks bitmask and permissions_version"]
         B2 --> B3{"Returns Ok?"}
         B3 -->|Yes| B4["Continue with protected logic"]
         B3 -->|Error| B5["Whole TX reverts"]
@@ -701,6 +708,8 @@ graph TB
 graph TD
     subgraph "Instruction Authorization Matrix"
         Init[initialize_organization] -->|Anyone| InitR[Caller becomes super_admin]
+
+        TSA[transfer_super_admin] -->|Super admin + new admin signs| TSAR[super_admin updated; org PDA unchanged]
 
         CrRole[create_role / delete_role] -->|Super admin + Updating state| CrRoleR[Chunk updated]
 
@@ -724,8 +733,8 @@ graph TD
         DlResCheck -->|Yes| DlResR[Resource deleted]
         DlResCheck -->|No| DlResErr[ERROR]
 
-        HasR[has_role] -->|Anyone| HasRR[Verify topo_index in assigned_roles]
-        HasP[has_permission] -->|Anyone| HasPR[Verify bitmask bit in UserAccount]
+        HasR[has_role] -->|Anyone| HasRR[O(1) bitmask on UserPermCache.effective_roles]
+        HasP[has_permission] -->|Anyone| HasPR[O(1) bitmask on UserPermCache.effective_permissions]
     end
 
     style AsErr fill:#f44336,color:#fff
@@ -738,6 +747,7 @@ graph TD
     style DlResR fill:#4CAF50,color:#fff
     style InitR fill:#4CAF50,color:#fff
     style CrRoleR fill:#4CAF50,color:#fff
+    style TSAR fill:#4CAF50,color:#fff
     style HasRR fill:#4CAF50,color:#fff
     style HasPR fill:#4CAF50,color:#fff
 ```
@@ -1084,8 +1094,30 @@ graph LR
 
 ## 16. Future Improvements
 
-### Batch size and compute limits
+### 16.1 Batch size and compute limits
 
 Very large batches (e.g. many users in `process_recompute_batch`, or many RoleChunks/PermChunks in `assign_role` / `revoke_role`) can hit Solana’s compute or account-per-tx limits and cause the transaction to fail.
 
 **What clients can do until then:** Keep batches small (e.g. fewer users per `process_recompute_batch` call, fewer chunks per `assign_role` / `revoke_role`). If a transaction fails with a compute or account-related error, split the work into multiple transactions with smaller batches and retry.
+
+---
+
+### 16.2 Program upgrade authority
+
+**Risk:** The program is deployed via Anchor using the standard BPF Loader. By default the upgrade authority is the deployer wallet. If that key is compromised, an attacker can replace the entire program binary — bypassing every on-chain access control this program enforces. This is outside the program's own instruction logic and must be managed at the deployment level.
+
+**Recommendation — pick the option that matches your maturity stage:**
+
+| Stage | Action | Command / Tool |
+|-------|--------|----------------|
+| **Development / Devnet** | Keep deployer key as authority for rapid iteration | *(default)* |
+| **Pre-mainnet / Stabilizing** | Transfer upgrade authority to a **Squads multisig** (3-of-5 recommended) | `solana program set-upgrade-authority <PROGRAM_ID> --new-upgrade-authority <SQUADS_VAULT>` |
+| **Mainnet — still evolving** | Keep multisig authority; add a **timelock** (e.g. 7-day delay via SPL Governance / Realms) so the community can react to malicious upgrade proposals | Squads + SPL Governance integration |
+| **Mainnet — stable / immutable** | **Revoke upgrade authority permanently** — program becomes immutable, no one can ever upgrade it | `solana program set-upgrade-authority <PROGRAM_ID> --final` |
+
+> **Note:** Section 11 (Trust & Governance Lifecycle) shows the recommended progression from single-key → multisig → DAO → immutable. The commands above are the concrete implementation steps for each phase.
+
+**Before revoking or transferring authority:**
+1. Verify the target address (multisig vault or burn address) on-chain — a typo here is irreversible.
+2. Confirm all intended programme changes are deployed and tested.
+3. If using Squads, test a no-op upgrade through the multisig flow first to validate the governance process end-to-end.

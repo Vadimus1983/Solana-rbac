@@ -3172,12 +3172,15 @@ describe("rbac", () => {
           authority: bob.publicKey,
           resourceCreator: carol.publicKey,
         })
+        .remainingAccounts([
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+        ])
         .signers([bob])
         .rpc();
       assert.fail("expected ConstraintSeeds");
     } catch (err) {
       assert.instanceOf(err, AnchorError);
-      // resource_creator is now part of the PDA seeds — Anchor's seed constraint
+      // resource_creator is part of the PDA seeds — Anchor's seed constraint
       // fires at account validation before the handler runs.
       assert.equal(
         (err as AnchorError).error.errorCode.code,
@@ -3195,6 +3198,9 @@ describe("rbac", () => {
         authority: bob.publicKey,
         resourceCreator: bob.publicKey,
       })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .signers([bob])
       .rpc();
 

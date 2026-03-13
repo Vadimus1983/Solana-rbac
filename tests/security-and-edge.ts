@@ -1116,6 +1116,9 @@ describe("security-and-edge", () => {
             authority: carol.publicKey,
             resourceCreator: bob.publicKey,
           })
+          .remainingAccounts([
+            { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+          ])
           .signers([carol])
           .rpc();
         assert.fail("expected InsufficientPermission");
@@ -1132,6 +1135,9 @@ describe("security-and-edge", () => {
           authority: bob.publicKey,
           resourceCreator: bob.publicKey,
         })
+        .remainingAccounts([
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+        ])
         .signers([bob])
         .rpc();
     });
