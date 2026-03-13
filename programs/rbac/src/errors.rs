@@ -128,4 +128,12 @@ pub enum RbacError {
     /// The proposed new super_admin is already the current super_admin.
     #[msg("The proposed new super_admin is already the current super_admin")]
     AlreadySuperAdmin,
+
+    /// User still has assigned roles — revoke all roles before closing the account.
+    #[msg("User still has assigned roles; revoke all before closing")]
+    UserHasRoles,
+
+    /// User still has direct permissions — revoke all before closing the account.
+    #[msg("User still has direct permissions; revoke all before closing")]
+    UserHasDirectPermissions,
 }

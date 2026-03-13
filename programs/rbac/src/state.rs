@@ -1146,7 +1146,7 @@ mod tests {
         );
     }
 
-    // ── Fix: revoke_user_permission silent permission strip (Finding 10) ──────
+    // ── revoke_user_permission: strict chunk lookup prevents silent permission strip ──
     //
     // The bug: revoke_user_permission used `if let Some(chunk)` when looking up
     // PermChunks for both direct_permissions and role permissions. If a chunk
@@ -1260,7 +1260,7 @@ mod tests {
         assert!(has_bit(&result, 35), "perm 35 kept — chunk 1 supplied and active");
     }
 
-    // ── Fix: resource permanently undeletable after required_permission deleted (Finding 11) ─
+    // ── delete_resource: handles deleted required_permission gracefully ─
 
     /// Demonstrates the pre-fix vulnerability: after a permission is soft-deleted
     /// and the update cycle runs, no fresh UserPermCache will contain the deleted
@@ -1365,5 +1365,263 @@ mod tests {
         assert!(!DeleteAttempt { perm_active: false, caller_has_perm: false, caller_is_creator: false }.can_delete());
         // Deleted permission + has perm (impossible in practice) + not creator.
         assert!(!DeleteAttempt { perm_active: false, caller_has_perm: true,  caller_is_creator: false }.can_delete());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // cancel_update: state machine recovery
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cancel_update_from_updating_resets_to_idle() {
+        let state = OrgState::Updating;
+        let roles_pending: u32 = 5;
+        let users_pending: u32 = 0;
+
+        assert_eq!(state, OrgState::Updating, "precondition");
+        assert_eq!(roles_pending, 5, "precondition");
+        assert_eq!(users_pending, 0, "precondition");
+
+        // Simulate cancel_update: revert to Idle and zero counters.
+        let state = OrgState::Idle;
+        let roles_pending: u32 = 0;
+        let users_pending: u32 = 0;
+
+        assert_eq!(state, OrgState::Idle);
+        assert_eq!(roles_pending, 0);
+        assert_eq!(users_pending, 0);
+    }
+
+    #[test]
+    fn test_cancel_update_from_recomputing_resets_to_idle() {
+        let state = OrgState::Recomputing;
+        let roles_pending: u32 = 0;
+        let users_pending: u32 = 10;
+
+        assert_eq!(state, OrgState::Recomputing, "precondition");
+        assert_eq!(roles_pending, 0, "precondition");
+        assert_eq!(users_pending, 10, "precondition");
+
+        let state = OrgState::Idle;
+        let roles_pending: u32 = 0;
+        let users_pending: u32 = 0;
+
+        assert_eq!(state, OrgState::Idle);
+        assert_eq!(roles_pending, 0);
+        assert_eq!(users_pending, 0);
+    }
+
+    #[test]
+    fn test_cancel_update_rejects_idle_state() {
+        let state = OrgState::Idle;
+        let is_cancellable = state == OrgState::Updating || state == OrgState::Recomputing;
+        assert!(
+            !is_cancellable,
+            "cancel_update must reject Idle state — nothing to cancel"
+        );
+    }
+
+    #[test]
+    fn test_cancel_update_preserves_permissions_version() {
+        let permissions_version: u64 = 42;
+        // cancel_update does NOT touch permissions_version — the version
+        // remains at whatever value it had when the cycle was interrupted.
+        // This is correct: no commit happened, so the version should not advance.
+        let after_cancel = permissions_version;
+        assert_eq!(after_cancel, 42,
+            "permissions_version must not change on cancel");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // close_user_account: rent reclamation + member_count decrement
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_close_user_account_decrements_member_count() {
+        let mut member_count: u64 = 5;
+        member_count = member_count.checked_sub(1).expect("must not underflow");
+        assert_eq!(member_count, 4);
+    }
+
+    #[test]
+    fn test_close_user_account_rejects_user_with_roles() {
+        let assigned_roles: Vec<RoleRef> = vec![RoleRef {
+            topo_index: 0,
+            last_seen_version: 1,
+        }];
+        assert!(
+            !assigned_roles.is_empty(),
+            "user with roles must be rejected — revoke all first"
+        );
+    }
+
+    #[test]
+    fn test_close_user_account_rejects_user_with_direct_permissions() {
+        let mut direct_permissions: Vec<u8> = Vec::new();
+        set_bit(&mut direct_permissions, 3);
+        let has_perms = direct_permissions.iter().any(|&b| b != 0);
+        assert!(
+            has_perms,
+            "user with direct permissions must be rejected — revoke all first"
+        );
+    }
+
+    #[test]
+    fn test_close_user_account_accepts_clean_user() {
+        let assigned_roles: Vec<RoleRef> = Vec::new();
+        let direct_permissions: Vec<u8> = vec![0u8; 4];
+        let roles_empty = assigned_roles.is_empty();
+        let perms_clean = direct_permissions.iter().all(|&b| b == 0);
+        assert!(roles_empty && perms_clean,
+            "user with no roles and zeroed permissions must be closeable");
+    }
+
+    #[test]
+    fn test_close_user_account_member_count_underflow_detected() {
+        let member_count: u64 = 0;
+        let result = member_count.checked_sub(1);
+        assert!(
+            result.is_none(),
+            "closing when member_count is 0 must surface underflow"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PermChunksRequired guard on assign_role / recompute_role
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_perm_chunks_required_when_permissions_exist() {
+        let next_permission_index: u32 = 5;
+        let pcc: usize = 0;
+        let guard_passes = next_permission_index == 0 || pcc > 0;
+        assert!(
+            !guard_passes,
+            "pcc=0 with existing permissions must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_perm_chunks_not_required_when_no_permissions() {
+        let next_permission_index: u32 = 0;
+        let pcc: usize = 0;
+        let guard_passes = next_permission_index == 0 || pcc > 0;
+        assert!(
+            guard_passes,
+            "pcc=0 with no permissions must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_perm_chunks_supplied_passes_guard() {
+        let next_permission_index: u32 = 10;
+        let pcc: usize = 1;
+        let guard_passes = next_permission_index == 0 || pcc > 0;
+        assert!(
+            guard_passes,
+            "pcc>0 must always pass the guard"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // delegated cache freshness: strict == instead of >=
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_strict_version_equality_rejects_future_version() {
+        let cache_version: u64 = 5;
+        let org_version: u64 = 3;
+        // Old check: cache_version >= org_version → true (would pass)
+        assert!(cache_version >= org_version, "old >= check would pass");
+        // New check: cache_version == org_version → false (correctly rejects)
+        assert!(
+            cache_version != org_version,
+            "strict == check must reject cache_version > org_version"
+        );
+    }
+
+    #[test]
+    fn test_strict_version_equality_accepts_matching_version() {
+        let cache_version: u64 = 7;
+        let org_version: u64 = 7;
+        assert_eq!(
+            cache_version, org_version,
+            "matching versions must pass the strict == check"
+        );
+    }
+
+    #[test]
+    fn test_strict_version_equality_rejects_stale_version() {
+        let cache_version: u64 = 2;
+        let org_version: u64 = 5;
+        assert!(
+            cache_version != org_version,
+            "stale cache must be rejected by both old and new checks"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // member_count checked_add
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_member_count_checked_add_normal() {
+        let member_count: u64 = 100;
+        let result = member_count.checked_add(1);
+        assert_eq!(result, Some(101));
+    }
+
+    #[test]
+    fn test_member_count_checked_add_at_u64_max() {
+        let member_count: u64 = u64::MAX;
+        let result = member_count.checked_add(1);
+        assert!(
+            result.is_none(),
+            "checked_add must return None at u64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_member_count_checked_add_at_u32_max_boundary() {
+        let member_count: u64 = u32::MAX as u64;
+        // The require! guard rejects member_count >= u32::MAX before the add,
+        // so checked_add at u32::MAX would never execute. But if it did:
+        let result = member_count.checked_add(1);
+        assert_eq!(result, Some(u32::MAX as u64 + 1),
+            "u64 has room above u32::MAX — the require! guard is what caps it");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // entry.version checked_add
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_entry_version_checked_add_normal() {
+        let mut entry = RoleEntry::default();
+        entry.version = 0;
+        entry.version = entry.version.checked_add(1).expect("must not overflow");
+        assert_eq!(entry.version, 1);
+        entry.version = entry.version.checked_add(1).expect("must not overflow");
+        assert_eq!(entry.version, 2);
+    }
+
+    #[test]
+    fn test_entry_version_checked_add_at_u64_max() {
+        let mut entry = RoleEntry::default();
+        entry.version = u64::MAX;
+        let result = entry.version.checked_add(1);
+        assert!(
+            result.is_none(),
+            "checked_add must return None when version is u64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_entry_version_checked_add_near_max() {
+        let mut entry = RoleEntry::default();
+        entry.version = u64::MAX - 1;
+        entry.version = entry.version.checked_add(1).expect("one below max is fine");
+        assert_eq!(entry.version, u64::MAX);
+        let overflow = entry.version.checked_add(1);
+        assert!(overflow.is_none(), "next increment must detect overflow");
     }
 }

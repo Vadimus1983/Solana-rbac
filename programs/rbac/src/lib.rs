@@ -48,6 +48,10 @@ pub mod rbac {
         instructions::finish_update::handler(ctx)
     }
 
+    pub fn cancel_update(ctx: Context<CancelUpdate>) -> Result<()> {
+        instructions::cancel_update::handler(ctx)
+    }
+
     // ── Permissions ─────────────────────────────────────────────────────
 
     pub fn create_permission(
@@ -116,6 +120,10 @@ pub mod rbac {
 
     pub fn create_user_account(ctx: Context<CreateUserAccount>) -> Result<()> {
         instructions::create_user_account::handler(ctx)
+    }
+
+    pub fn close_user_account(ctx: Context<CloseUserAccount>) -> Result<()> {
+        instructions::close_user_account::handler(ctx)
     }
 
     pub fn assign_role(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) -> Result<()> {

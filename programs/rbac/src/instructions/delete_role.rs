@@ -52,7 +52,10 @@ pub fn handler(ctx: Context<DeleteRole>, role_index: u32) -> Result<()> {
     entry.direct_permissions.clear();
     entry.effective_permissions.clear();
     entry.children.clear();
-    entry.version += 1;
+    entry.version = entry
+        .version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
 
     // Keep active_role_count in sync so begin_update can seed
     // roles_pending_recompute with the correct number of live roles.

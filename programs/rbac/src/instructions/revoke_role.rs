@@ -125,7 +125,7 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
             RbacError::NotSuperAdmin
         );
         require!(
-            caller_cache.permissions_version >= org_permissions_version,
+            caller_cache.permissions_version == org_permissions_version,
             RbacError::StalePermissions
         );
         require!(

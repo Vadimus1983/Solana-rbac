@@ -396,7 +396,7 @@ describe("security-and-edge", () => {
       // Attack: pass Bob's user_account with Carol's user_perm_cache; PDA/constraint ties cache to user_account.user.
       try {
         await program.methods
-          .assignRole(role0, 0)
+          .assignRole(role0, 1)
           .accounts({
             userAccount: bobUaPda,
             userPermCache: carolUpcPda, // wrong: cache must be for same user as user_account
@@ -405,6 +405,9 @@ describe("security-and-edge", () => {
             authority: alice.publicKey,
             systemProgram: SystemProgram.programId,
           })
+          .remainingAccounts([
+            { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+          ])
           .rpc();
         assert.fail("expected constraint mismatch");
       } catch (err: any) {
@@ -1081,7 +1084,7 @@ describe("security-and-edge", () => {
     it("deleteResource: caller without required permission gets InsufficientPermission", async () => {
       // Bob gets role1 (has perm1); Bob creates resource requiring perm1. Carol (only perm0) tries to delete.
       await program.methods
-        .assignRole(role1, 0)
+        .assignRole(role1, 1)
         .accounts({
           userAccount: bobUaPda,
           userPermCache: bobUpcPda,
@@ -1090,6 +1093,9 @@ describe("security-and-edge", () => {
           authority: alice.publicKey,
           systemProgram: SystemProgram.programId,
         })
+        .remainingAccounts([
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+        ])
         .rpc();
 
       const resourceId = new anchor.BN(8001);

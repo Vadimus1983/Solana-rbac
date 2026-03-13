@@ -47,7 +47,10 @@ pub fn handler(ctx: Context<RemoveChildRole>, parent_index: u32, child_index: u3
     let pos = entry.children.iter().position(|&c| c == child_index);
     require!(pos.is_some(), RbacError::ChildRoleNotLinked);
     entry.children.swap_remove(pos.unwrap());
-    entry.version += 1;
+    entry.version = entry
+        .version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
 
     // Reclaim the 4 bytes freed by swap_remove so lamports are not locked
     // indefinitely (add_child_role allocates +4 bytes; mirror that here).

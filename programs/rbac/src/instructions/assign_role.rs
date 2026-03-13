@@ -72,6 +72,12 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
     let org = &ctx.accounts.organization;
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
 
+    let pcc = perm_chunk_count as usize;
+    require!(
+        org.next_permission_index == 0 || pcc > 0,
+        RbacError::PermChunksRequired
+    );
+
     let org_key = org.key();
     let org_permissions_version = org.permissions_version;
 
@@ -113,7 +119,7 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
             RbacError::NotSuperAdmin
         );
         require!(
-            caller_cache.permissions_version >= org_permissions_version,
+            caller_cache.permissions_version == org_permissions_version,
             RbacError::StalePermissions
         );
         require!(
@@ -127,7 +133,6 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         base_offset = 0;
     }
 
-    let pcc = perm_chunk_count as usize;
     require!(
         base_offset + pcc <= ctx.remaining_accounts.len(),
         RbacError::AccountCountMismatch

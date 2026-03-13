@@ -112,7 +112,10 @@ pub fn handler(
     let chunk = &mut ctx.accounts.role_chunk;
     let entry = &mut chunk.entries[slot];
     set_bit(&mut entry.direct_permissions, permission_index);
-    entry.version += 1;
+    entry.version = entry
+        .version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
 
     emit!(RolePermissionAdded {
         organization: ctx.accounts.organization.key(),

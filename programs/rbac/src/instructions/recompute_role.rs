@@ -48,6 +48,10 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         ctx.accounts.organization.state == OrgState::Updating,
         RbacError::OrgNotInUpdateMode
     );
+    require!(
+        ctx.accounts.organization.next_permission_index == 0 || perm_chunk_count > 0,
+        RbacError::PermChunksRequired
+    );
 
     let parent_chunk_idx = role_index / ROLES_PER_CHUNK as u32;
     let slot = role_index as usize % ROLES_PER_CHUNK;
@@ -293,7 +297,10 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     let entry = &mut ctx.accounts.role_chunk.entries[slot];
     entry.effective_permissions = result;
     entry.children = new_children;
-    entry.version += 1;
+    entry.version = entry
+        .version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
     entry.recompute_epoch = org_permissions_version;
 
     // Decrement the recompute counter so commit_update can enforce that all

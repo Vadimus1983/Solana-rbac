@@ -113,7 +113,10 @@ pub fn handler(ctx: Context<AddChildRole>, parent_index: u32, child_index: u32) 
     let chunk = &mut ctx.accounts.role_chunk;
     let parent_entry = &mut chunk.entries[parent_slot];
     parent_entry.children.push(child_index);
-    parent_entry.version += 1;
+    parent_entry.version = parent_entry
+        .version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
 
     emit!(ChildRoleAdded {
         organization: org_key,

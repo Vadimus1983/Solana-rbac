@@ -44,7 +44,10 @@ pub fn handler(ctx: Context<RemoveRolePermission>, role_index: u32, permission_i
     require!(has_bit(&entry.direct_permissions, permission_index), RbacError::PermissionNotAssigned);
 
     clear_bit(&mut entry.direct_permissions, permission_index);
-    entry.version += 1;
+    entry.version = entry
+        .version
+        .checked_add(1)
+        .ok_or(error!(RbacError::VersionOverflow))?;
 
     emit!(RolePermissionRemoved {
         organization: ctx.accounts.organization.key(),

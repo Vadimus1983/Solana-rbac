@@ -154,22 +154,16 @@ describe("rbac", () => {
     const roleCount = org.roleCount as number;
     if (roleCount === 0) return;
     const currentVersion = org.permissionsVersion as anchor.BN;
+    const hasPerms = (org.nextPermissionIndex as number) > 0;
+    const pcc = hasPerms ? 1 : 0;
     const numChunks = Math.ceil(roleCount / ROLES_PER_CHUNK);
     for (let ci = 0; ci < numChunks; ci++) {
       const [chunkPda] = findRoleChunkPda(program.programId, targetOrgPda, ci);
       const chunk = await (program.account as any).roleChunk.fetch(chunkPda);
       for (const entry of chunk.entries) {
         if (!entry.active) continue;
-        // Skip roles already recomputed this cycle — makes the helper idempotent
-        // so it can be called multiple times within a single update cycle without
-        // hitting the AlreadyRecomputed guard.
         if ((entry.recomputeEpoch as anchor.BN).eq(currentVersion)) continue;
 
-        const hasDirectPerms = (entry.directPermissions as number[]).some((b: number) => b !== 0);
-        const pcc = hasDirectPerms ? 1 : 0;
-
-        // Collect unique cross-chunk child RoleChunk PDAs (children whose chunk
-        // index differs from the role being recomputed need to be in remaining_accounts).
         const children = entry.children as number[];
         const crossChunkIdxSet = new Set<number>(
           children
@@ -182,7 +176,7 @@ describe("rbac", () => {
         });
 
         const remainingAccts = [
-          ...(hasDirectPerms ? [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }] : []),
+          ...(hasPerms ? [{ pubkey: permChunk0Pda, isWritable: false, isSigner: false }] : []),
           ...childChunkAccts,
         ];
 
@@ -522,7 +516,7 @@ describe("rbac", () => {
   // -------------------------------------------------------------------------
   it("Step 11a: Alice assigns Bob the editor role (Idle state)", async () => {
     await program.methods
-      .assignRole(editorRoleIdx, 0)  // perm_chunk_count=0: trust cached effective_perms
+      .assignRole(editorRoleIdx, 1)
       .accounts({
         userAccount: bobUaPda,
         userPermCache: bobUpcPda,
@@ -531,6 +525,9 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     const ua = await program.account.userAccount.fetch(bobUaPda);
@@ -554,7 +551,7 @@ describe("rbac", () => {
 
   it("Step 11b: Alice assigns Carol the viewer role (Idle state)", async () => {
     await program.methods
-      .assignRole(viewerRoleIdx, 0)  // perm_chunk_count=0: trust cached effective_perms
+      .assignRole(viewerRoleIdx, 1)
       .accounts({
         userAccount: carolUaPda,
         userPermCache: carolUpcPda,
@@ -563,6 +560,9 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     const ua = await program.account.userAccount.fetch(carolUaPda);
@@ -1069,7 +1069,7 @@ describe("rbac", () => {
     // Without the fix this would succeed; with the fix it must fail.
     try {
       await program.methods
-        .assignRole(viewerRoleIdx, 0)  // pcc=0 for this attack attempt
+        .assignRole(viewerRoleIdx, 1)
         .accounts({
           userAccount: daveUaPda,
           userPermCache: daveUpcPda,
@@ -1081,6 +1081,7 @@ describe("rbac", () => {
         .remainingAccounts([
           // Attack: pass carol's cache from a different org
           { pubkey: carolUpcAttackOrgPda, isWritable: false, isSigner: false },
+          { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
         ])
         .signers([carol])
         .rpc();
@@ -1102,7 +1103,7 @@ describe("rbac", () => {
   it("cross-org revoke_role: supplying a cache from a different org is rejected with NotSuperAdmin", async () => {
     // Alice (super_admin) first assigns the viewer role to dave legitimately.
     await program.methods
-      .assignRole(viewerRoleIdx, 0)  // pcc=0: trust cached effective_perms
+      .assignRole(viewerRoleIdx, 1)
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1111,6 +1112,9 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     {
@@ -1246,7 +1250,7 @@ describe("rbac", () => {
 
     // Now carol (delegated) assigns the viewer role to dave using her acme_corp cache.
     await program.methods
-      .assignRole(viewerRoleIdx, 0)  // pcc=0: trust cached effective_perms
+      .assignRole(viewerRoleIdx, 1)
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1258,6 +1262,7 @@ describe("rbac", () => {
       .remainingAccounts([
         // Legitimate: carol's own acme_corp cache as delegation proof
         { pubkey: carolUpcPda, isWritable: false, isSigner: false },
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
       ])
       .signers([carol])
       .rpc();
@@ -1516,7 +1521,7 @@ describe("rbac", () => {
     //   effectivePermissions: bit readPermIdx (viewer already provides it)
 
     await program.methods
-      .assignRole(viewerRoleIdx, 0)
+      .assignRole(viewerRoleIdx, 1)
       .accounts({
         userAccount: daveUaPda,
         userPermCache: daveUpcPda,
@@ -1525,6 +1530,9 @@ describe("rbac", () => {
         authority: alice.publicKey,
         systemProgram: SystemProgram.programId,
       })
+      .remainingAccounts([
+        { pubkey: permChunk0Pda, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     await program.methods
@@ -2996,7 +3004,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix H-1: revokeUserPermission requires PermChunks when org has permissions.
+  // revokeUserPermission requires PermChunks when org has permissions.
   // Calling with pcc=0 when next_permission_index > 0 must fail PermChunksRequired.
   // ---------------------------------------------------------------------------
   it("revokeUserPermission with pcc=0 when org has permissions is rejected with PermChunksRequired", async () => {
@@ -3051,7 +3059,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix H-2: remaining_accounts slice bounds validated before indexing.
+  // remaining_accounts slice bounds validated before indexing.
   // Passing pcc > remaining_accounts.len() must fail with AccountCountMismatch.
   // ---------------------------------------------------------------------------
   it("assignRole with pcc exceeding remaining_accounts length is rejected with AccountCountMismatch", async () => {
@@ -3080,7 +3088,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix M-1: org PDA seeds include the creator pubkey so different admins can
+  // org PDA seeds include the creator pubkey so different admins can
   // create orgs with the same name without collision.
   // ---------------------------------------------------------------------------
   it("two admins can create orgs with the same name without PDA collision", async () => {
@@ -3126,7 +3134,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix M-2: deleteResource closes the account to resource.creator, not authority.
+  // deleteResource closes the account to resource.creator, not authority.
   // Passing a wrong resource_creator account must fail with NotResourceCreator.
   // ---------------------------------------------------------------------------
   it("deleteResource rejects wrong resource_creator and closes to the correct creator", async () => {
@@ -3225,7 +3233,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix L-1: transferSuperAdmin changes authority while keeping org PDA stable.
+  // transferSuperAdmin changes authority while keeping org PDA stable.
   // The originalAdmin field is set at init and never changes.
   // ---------------------------------------------------------------------------
   it("transferSuperAdmin changes authority, old admin is rejected, and transfer back restores access", async () => {
@@ -3294,7 +3302,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix L-2: manage_roles_permission is stored per-org and read at delegation time
+  // manage_roles_permission is stored per-org and read at delegation time
   // instead of using a hardcoded constant.
   // ---------------------------------------------------------------------------
   it("organization.manageRolesPermission reflects the value set at initialization", async () => {
@@ -3340,7 +3348,7 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fix L-3: createResource and deleteResource require OrgState::Idle.
+  // createResource and deleteResource require OrgState::Idle.
   // Calling either during an active update cycle must fail with OrgNotIdle.
   // ---------------------------------------------------------------------------
   it("createResource is rejected during Updating state with OrgNotIdle", async () => {
@@ -3525,10 +3533,10 @@ describe("rbac", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // recomputeRole with pcc=0 on a parent whose child has
-  // permissions must fail with ChunkNotFound (previously silently zeroed parent).
+  // recomputeRole with pcc=0 when org has permissions must fail with
+  // PermChunksRequired defense-in-depth guard.
   // ---------------------------------------------------------------------------
-  it("recomputeRole pcc=0 for parent with child permissions fails ChunkNotFound", async () => {
+  it("recomputeRole pcc=0 for parent with child permissions fails PermChunksRequired", async () => {
     const admin3 = Keypair.generate();
     const sig3 = await provider.connection.requestAirdrop(admin3.publicKey, 2 * LAMPORTS_PER_SOL);
     await provider.connection.confirmTransaction(sig3);
@@ -3574,33 +3582,24 @@ describe("rbac", () => {
       .remainingAccounts([{ pubkey: pc3_0, isWritable: false, isSigner: false }])
       .signers([admin3]).rpc();
 
-    // Recompute parent (role 1) with pcc=0 — must FAIL because child has perm bits
-    // that require chunk lookup when pcc > 0... wait, with pcc=0 and the new fix,
-    // child bits are trusted as-is and included. So this actually should SUCCEED now.
-    // The bug was that pcc=0 silently DROPPED child bits. The fix makes pcc=0 INCLUDE them.
-    // Verify the parent gets the child's permissions after recompute with pcc=0.
-    await program.methods.recomputeRole(1, 0)
-      .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
-      .remainingAccounts([])
-      .signers([admin3]).rpc();
+    // Recompute parent (role 1) with pcc=0 — must FAIL with PermChunksRequired
+    // because the org has permissions (next_permission_index > 0).
+    try {
+      await program.methods.recomputeRole(1, 0)
+        .accounts({ roleChunk: rc3_0, organization: org3Pda, authority: admin3.publicKey, systemProgram: SystemProgram.programId })
+        .remainingAccounts([])
+        .signers([admin3]).rpc();
+      assert.fail("expected PermChunksRequired");
+    } catch (err) {
+      assert.instanceOf(err, AnchorError);
+      assert.equal(
+        (err as AnchorError).error.errorCode.code,
+        "PermChunksRequired"
+      );
+    }
 
-    // Verify parent's effective_permissions now contains perm 0 (inherited from child).
-    const chunk3 = await (program.account as any).roleChunk.fetch(rc3_0);
-    const parentEntry = chunk3.entries[1]; // slot 1 = topo_index 1
-    assert.ok(
-      (parentEntry.directPermissions as number[]).every((b: number) => b === 0),
-      "parent must have no direct permissions"
-    );
-    assert.ok(
-      hasBit(parentEntry.effectivePermissions as number[], 0),
-      "parent must have inherited perm 0 from child (Bug3 fix: pcc=0 now trusts child eff perms)"
-    );
-
-    // Cleanup: commit + finish (no users, so no batch needed).
-    await program.methods.commitUpdate()
-      .accounts({ organization: org3Pda, authority: admin3.publicKey })
-      .signers([admin3]).rpc();
-    await program.methods.finishUpdate()
+    // Cleanup: cancel the update cycle so the org returns to Idle.
+    await program.methods.cancelUpdate()
       .accounts({ organization: org3Pda, authority: admin3.publicKey })
       .signers([admin3]).rpc();
   });
