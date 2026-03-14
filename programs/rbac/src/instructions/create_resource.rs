@@ -69,8 +69,11 @@ pub fn handler(
     );
 
     require!(org.state == OrgState::Idle, RbacError::OrgNotIdle);
+    // Strict equality: >= would silently accept future-dated caches
+    // (permissions_version > org version), which should never legitimately exist
+    // and could indicate a tampered or replayed cache account.
     require!(
-        cache.permissions_version >= org.permissions_version,
+        cache.permissions_version == org.permissions_version,
         RbacError::StalePermissions
     );
     require!(

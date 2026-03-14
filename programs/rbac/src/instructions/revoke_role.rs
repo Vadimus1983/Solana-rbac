@@ -99,7 +99,9 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         let cache_info = &ctx.remaining_accounts[0];
         require!(cache_info.owner == ctx.program_id, RbacError::NotSuperAdmin);
 
-        // Verify PDA derivation to prevent cross-org privilege escalation.
+        // Verify PDA derivation FIRST to prevent cross-org privilege escalation.
+        // The manage_roles_permission bounds check must come after this so
+        // cross-org attacks always receive NotSuperAdmin.
         let (expected_pda, _) = Pubkey::find_program_address(
             &[
                 b"user_perm_cache",
@@ -124,6 +126,15 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
             caller_cache.organization == org_key,
             RbacError::NotSuperAdmin
         );
+
+        // Reject delegation when manage_roles_permission was never actually
+        // created as a permission (same guard as assign_role).  Placed after the
+        // cross-org PDA check so attackers always see NotSuperAdmin.
+        require!(
+            org.manage_roles_permission < org.next_permission_index,
+            RbacError::InvalidPermissionIndex
+        );
+
         require!(
             caller_cache.permissions_version == org_permissions_version,
             RbacError::StalePermissions
@@ -139,22 +150,6 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         base_offset = 0;
     }
 
-    // Delegated-path privilege-escalation guard: a delegated manager may only
-    // revoke a role whose effective permissions are a subset of their own.
-    // We read from the named role_chunk (in Idle state its effective_permissions
-    // are already filtered by the last recompute_role call, so raw == filtered).
-    if let Some(ref caller_perms) = caller_effective_perms {
-        let slot = role_index as usize % ROLES_PER_CHUNK;
-        let chunk = &ctx.accounts.role_chunk;
-        require!(slot < chunk.entries.len(), RbacError::RoleSlotEmpty);
-        let entry = &chunk.entries[slot];
-        require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
-        require!(
-            bitmask_is_subset(&entry.effective_permissions, caller_perms),
-            RbacError::InsufficientPermission
-        );
-    }
-
     require!(
         base_offset + pcc <= ctx.remaining_accounts.len(),
         RbacError::AccountCountMismatch
@@ -162,13 +157,77 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
     let perm_accounts = &ctx.remaining_accounts[base_offset..base_offset + pcc];
     let role_chunks = &ctx.remaining_accounts[base_offset + pcc..];
 
-    // Index chunks once for O(1) lookups.
+    // Build perm_index BEFORE the subset check so the subset check can use
+    // freshly-filtered direct_permissions rather than the stored (potentially
+    // stale) effective_permissions.
     let perm_index = if pcc > 0 {
         Some(build_perm_chunk_index(perm_accounts, &org_key, ctx.program_id)?)
     } else {
         None
     };
     let role_chunk_index = build_role_chunk_index(role_chunks, &org_key, ctx.program_id)?;
+
+    // Delegated-path privilege-escalation guard: a delegated manager may only
+    // revoke a role whose permissions are a subset of their own.
+    //
+    // After cancel_update, a role's stored effective_permissions may not reflect
+    // direct_permissions changes made during the cancelled Updating phase
+    // (add_role_permission / remove_role_permission were called but recompute_role
+    // never ran).  Using only the stored effective_permissions for the subset
+    // check would let a caller pass against the stale (lower) value even though
+    // the role now grants more permissions than recorded.
+    //
+    // Re-derive the role's direct permissions by filtering direct_permissions
+    // through PermChunks, then union with the stored effective_permissions.
+    // Taking the union of both gives the maximum possible grant set and keeps
+    // the check safe in all states (newly-added perms appear via direct;
+    // child-inherited perms appear via stored effective which only changes via
+    // recompute_role).
+    if let Some(ref caller_perms) = caller_effective_perms {
+        let slot = role_index as usize % ROLES_PER_CHUNK;
+        let chunk = &ctx.accounts.role_chunk;
+        require!(slot < chunk.entries.len(), RbacError::RoleSlotEmpty);
+        let entry = &chunk.entries[slot];
+        require!(entry.topo_index == role_index, RbacError::RoleSlotEmpty);
+
+        // Re-derive direct permissions through PermChunks.
+        let fresh_direct: Vec<u8> = if pcc > 0 {
+            let mut eff = Vec::new();
+            for (byte_idx, &byte) in entry.direct_permissions.iter().enumerate() {
+                if byte == 0 {
+                    continue;
+                }
+                for bit in 0..8u32 {
+                    if byte & (1 << bit) != 0 {
+                        let perm_idx_val = (byte_idx as u32) * 8 + bit;
+                        let perm_chunk_idx = perm_idx_val / PERMS_PER_CHUNK as u32;
+                        let perm_slot = perm_idx_val as usize % PERMS_PER_CHUNK;
+                        let perm_chunk = perm_index
+                            .as_ref()
+                            .and_then(|idx| idx.get(&perm_chunk_idx))
+                            .ok_or(RbacError::ChunkNotFound)?;
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_idx_val
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut eff, perm_idx_val);
+                        }
+                    }
+                }
+            }
+            eff
+        } else {
+            Vec::new()
+        };
+
+        // Union fresh_direct with stored effective_permissions so that
+        // child-inherited bits (only updated by recompute_role) are included.
+        let role_max_grant = bitmask_union(&entry.effective_permissions, &fresh_direct);
+        require!(
+            bitmask_is_subset(&role_max_grant, caller_perms),
+            RbacError::InsufficientPermission
+        );
+    }
 
     let ua = &mut ctx.accounts.user_account;
 

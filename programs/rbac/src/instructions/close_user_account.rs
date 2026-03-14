@@ -59,6 +59,18 @@ pub fn handler(ctx: Context<CloseUserAccount>) -> Result<()> {
         ua.direct_permissions.iter().all(|&b| b == 0),
         RbacError::UserHasDirectPermissions
     );
+    // Also assert effective_permissions is zeroed.
+    // In a consistent state this follows from the two checks above (effective ⊇
+    // direct, and effective ⊇ union-of-role-permissions).  However, if a bug
+    // or out-of-order sequence left effective_permissions non-zero while
+    // assigned_roles is empty and direct_permissions is zero (e.g., a partially
+    // reverted inline recompute), we must refuse to close the account rather
+    // than silently leaving residual permission bits that could affect a
+    // recreated account at the same PDA.
+    require!(
+        ua.effective_permissions.iter().all(|&b| b == 0),
+        RbacError::UserHasEffectivePermissions
+    );
 
     org.member_count = org
         .member_count

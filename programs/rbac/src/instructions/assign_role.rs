@@ -92,8 +92,10 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         let cache_info = &ctx.remaining_accounts[0];
         require!(cache_info.owner == ctx.program_id, RbacError::NotSuperAdmin);
 
-        // Verify the PDA derivation to prevent a caller from supplying
-        // a UserPermCache that belongs to a different organization.
+        // Verify the PDA derivation FIRST to prevent a caller from supplying
+        // a UserPermCache that belongs to a different organization (cross-org
+        // privilege escalation).  The manage_roles_permission bounds check below
+        // must come after this so cross-org attacks always get NotSuperAdmin.
         let (expected_pda, _) = Pubkey::find_program_address(
             &[
                 b"user_perm_cache",
@@ -118,6 +120,18 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
             caller_cache.organization == org_key,
             RbacError::NotSuperAdmin
         );
+
+        // Reject delegation when manage_roles_permission has never been created
+        // as an actual permission.  At org creation any value < 256 is accepted;
+        // if the admin set it to an index beyond next_permission_index no user
+        // can ever hold that bit, so delegation is permanently disabled.
+        // Placed after the cross-org PDA check so attackers always see
+        // NotSuperAdmin rather than a potentially informative InvalidPermissionIndex.
+        require!(
+            org.manage_roles_permission < org.next_permission_index,
+            RbacError::InvalidPermissionIndex
+        );
+
         require!(
             caller_cache.permissions_version == org_permissions_version,
             RbacError::StalePermissions
@@ -186,9 +200,16 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         filtered
     } else {
         // pcc == 0: no PermChunks supplied — trust the stored effective_permissions.
-        // Safe in Idle state: commit_update enforces roles_pending_recompute == 0
-        // before the cycle closes, so all roles are freshly recomputed and their
-        // effective_permissions can no longer contain deleted-permission bits.
+        // Safe because the PermChunksRequired guard (above) only allows pcc==0
+        // when next_permission_index == 0 (no permissions have ever been created).
+        // Therefore no role can have any bits set in effective_permissions.
+        //
+        // Enforce this invariant explicitly so any future loosening of the guard
+        // is caught immediately rather than silently trusting stale data.
+        require!(
+            raw_effective.iter().all(|&b| b == 0),
+            RbacError::PermChunksRequired
+        );
         raw_effective
     };
 

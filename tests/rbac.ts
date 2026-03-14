@@ -153,7 +153,10 @@ describe("rbac", () => {
     const org = await program.account.organization.fetch(targetOrgPda);
     const roleCount = org.roleCount as number;
     if (roleCount === 0) return;
-    const currentVersion = org.permissionsVersion as anchor.BN;
+    // recompute_role stamps entry.recompute_epoch with org.update_nonce (not
+    // permissions_version), so compare against update_nonce to detect which
+    // roles have already been processed in the current update cycle.
+    const cycleEpoch = org.updateNonce as anchor.BN;
     const hasPerms = (org.nextPermissionIndex as number) > 0;
     const pcc = hasPerms ? 1 : 0;
     const numChunks = Math.ceil(roleCount / ROLES_PER_CHUNK);
@@ -162,7 +165,7 @@ describe("rbac", () => {
       const chunk = await (program.account as any).roleChunk.fetch(chunkPda);
       for (const entry of chunk.entries) {
         if (!entry.active) continue;
-        if ((entry.recomputeEpoch as anchor.BN).eq(currentVersion)) continue;
+        if ((entry.recomputeEpoch as anchor.BN).eq(cycleEpoch)) continue;
 
         const children = entry.children as number[];
         const crossChunkIdxSet = new Set<number>(

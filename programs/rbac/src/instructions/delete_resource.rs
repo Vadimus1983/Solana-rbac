@@ -85,8 +85,9 @@ pub fn handler(ctx: Context<DeleteResource>) -> Result<()> {
     if perm_is_active {
         // Normal path: permission is still active — caller must hold it in
         // a fresh UserPermCache.
+        // Strict equality: same rationale as create_resource.
         require!(
-            cache.permissions_version >= org.permissions_version,
+            cache.permissions_version == org.permissions_version,
             RbacError::StalePermissions
         );
         require!(

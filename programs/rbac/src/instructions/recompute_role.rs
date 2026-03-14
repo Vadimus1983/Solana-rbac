@@ -65,8 +65,11 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         require!(entry.active, RbacError::RoleInactive);
         // Idempotency guard: prevent double-decrementing roles_pending_recompute
         // by re-running recompute_role on the same role in one update cycle.
+        // Uses update_nonce (not permissions_version) so that after a
+        // cancel_update the old epoch value differs from the new cycle's nonce,
+        // preventing an AlreadyRecomputed deadlock in the subsequent cycle.
         require!(
-            entry.recompute_epoch != ctx.accounts.organization.permissions_version,
+            entry.recompute_epoch != ctx.accounts.organization.update_nonce,
             RbacError::AlreadyRecomputed
         );
     }
@@ -90,7 +93,13 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
     };
     let role_chunk_index = build_role_chunk_index(role_accounts, &org_key, ctx.program_id)?;
 
-    let org_permissions_version = ctx.accounts.organization.permissions_version;
+    // Use update_nonce as the per-cycle epoch identifier.  permissions_version
+    // is only incremented at commit_update, so two successive begin/cancel/begin
+    // cycles would share the same permissions_version — causing the topo check
+    // to accept stale epochs from the cancelled cycle as "fresh".  update_nonce
+    // is incremented by both begin_update and cancel_update, giving each cycle
+    // a unique value.
+    let org_update_nonce = ctx.accounts.organization.update_nonce;
     // Enforce topological order: every child must have been recomputed this cycle before this parent.
     for &child_topo in &children {
         let child_chunk_idx = child_topo / ROLES_PER_CHUNK as u32;
@@ -123,7 +132,7 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
             }
         };
         require!(
-            child_recompute_epoch == org_permissions_version,
+            child_recompute_epoch == org_update_nonce,
             RbacError::ChildRoleNotRecomputed
         );
     }
@@ -217,7 +226,7 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
                     } else {
                         // pcc == 0: trust the child's stored effective_permissions.
                         // Safe: topological ordering ensures children were freshly
-                        // recomputed this cycle (recompute_epoch == permissions_version),
+                        // recomputed this cycle (recompute_epoch == update_nonce),
                         // so their effective_permissions are clean.
                         set_bit(&mut result, perm_index_val);
                     }
@@ -301,7 +310,9 @@ pub fn handler(ctx: Context<RecomputeRole>, role_index: u32, perm_chunk_count: u
         .version
         .checked_add(1)
         .ok_or(error!(RbacError::VersionOverflow))?;
-    entry.recompute_epoch = org_permissions_version;
+    // Stamp with update_nonce (not permissions_version) so that cancel_update
+    // invalidates this epoch for the subsequent cycle.
+    entry.recompute_epoch = org_update_nonce;
 
     // Decrement the recompute counter so commit_update can enforce that all
     // active roles were processed before closing the update cycle.

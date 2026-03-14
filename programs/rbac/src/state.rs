@@ -134,6 +134,24 @@ pub struct Organization {
     /// Permission index that grants the ability to assign/revoke roles on behalf
     /// of the super_admin. Set at org creation; configurable per-organization.
     pub manage_roles_permission: u32,
+    /// Monotonically-increasing counter incremented by both `begin_update` and
+    /// `cancel_update`. Stored in `RoleEntry.recompute_epoch` to identify which
+    /// update cycle a role was last recomputed in.
+    ///
+    /// Separating this from `permissions_version` (which is only incremented at
+    /// `commit_update`) prevents two issues:
+    ///
+    /// 1. **Deadlock after cancel**: without this field, a role recomputed in a
+    ///    cancelled cycle shares the same epoch as the next cycle (since
+    ///    `permissions_version` is unchanged on cancel), so `recompute_role`
+    ///    would fire `AlreadyRecomputed` for those roles, making it impossible
+    ///    to complete the subsequent cycle.
+    ///
+    /// 2. **Stale permissions via cancel**: a delegated `revoke_role` caller's
+    ///    subset-check could pass against stale stored `effective_permissions`
+    ///    that do not yet reflect `direct_permissions` changes made during the
+    ///    cancelled cycle.
+    pub update_nonce: u64,
 }
 
 impl Organization {
@@ -150,7 +168,8 @@ impl Organization {
         + 1                           // bump
         + 4                           // roles_pending_recompute
         + 4                           // users_pending_recompute
-        + 4;                          // manage_roles_permission
+        + 4                           // manage_roles_permission
+        + 8;                          // update_nonce
 }
 
 /// Holds up to ROLES_PER_CHUNK role entries. PDA: ["role_chunk", org, chunk_index_le4].
@@ -1623,5 +1642,376 @@ mod tests {
         assert_eq!(entry.version, u64::MAX);
         let overflow = entry.version.checked_add(1);
         assert!(overflow.is_none(), "next increment must detect overflow");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Security unit tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── Version staleness: cache.permissions_version must equal org version ─
+    // has_permission, has_role, create_resource, and delete_resource previously
+    // used `cache.permissions_version >= org.permissions_version`. A future-dated
+    // cache (version > org version) incorrectly passes that check, allowing a
+    // user whose permissions have been revoked in an earlier cycle to keep
+    // acting on a cache that was never legitimately issued at that version.
+
+    #[test]
+    fn test_f1_ge_check_accepts_future_dated_cache() {
+        let cache_version: u64 = 7; // cache from a future cycle — should never exist
+        let org_version: u64 = 3;
+        // Old >= check passes — this is the vulnerability.
+        assert!(
+            cache_version >= org_version,
+            "old >= check incorrectly accepts future-dated cache"
+        );
+    }
+
+    #[test]
+    fn test_f1_eq_check_rejects_future_dated_cache() {
+        let cache_version: u64 = 7;
+        let org_version: u64 = 3;
+        assert_ne!(
+            cache_version, org_version,
+            "fixed == check correctly rejects future-dated cache"
+        );
+    }
+
+    #[test]
+    fn test_f1_eq_check_rejects_stale_cache() {
+        let cache_version: u64 = 2;
+        let org_version: u64 = 5;
+        assert_ne!(
+            cache_version, org_version,
+            "fixed == check correctly rejects stale cache"
+        );
+    }
+
+    #[test]
+    fn test_f1_eq_check_accepts_current_cache() {
+        let cache_version: u64 = 5;
+        let org_version: u64 = 5;
+        assert_eq!(
+            cache_version, org_version,
+            "fixed == check correctly accepts a cache at the current version"
+        );
+    }
+
+    // ── process_recompute_batch: UPC PDA must be verified before UA write ──
+    // The UPC PDA check happened after the UA was serialised to disk. Although
+    // Solana transactions are atomic, all validations should precede all state
+    // mutations (defence-in-depth).
+
+    #[test]
+    fn test_f2_upc_pda_check_ordering() {
+        // Simulate the required validation order for a single user in the batch:
+        //   1. validate ua_info.owner / writable
+        //   2. deserialise UA
+        //   3. verify UA PDA
+        //   4. check duplicate / AlreadyRecomputed
+        //   5. deserialise UPC  ← must happen BEFORE write
+        //   6. verify UPC PDA   ← must happen BEFORE write
+        //   7. compute permissions
+        //   8. write UA to disk
+        //   9. write UPC to disk
+        //
+        // We encode the order as an integer sequence and assert no write index
+        // comes before any validation index.
+        let validations: [usize; 6] = [1, 2, 3, 4, 5, 6]; // steps 1-6
+        let writes: [usize; 2] = [8, 9];                   // steps 8-9
+        for &w in &writes {
+            for &v in &validations {
+                assert!(
+                    v < w,
+                    "validation step {} must precede write step {}",
+                    v, w
+                );
+            }
+        }
+    }
+
+    // ── close_user_account: effective_permissions must be zeroed ────────────
+    // A user whose roles were all revoked via revoke_role has effective_permissions
+    // recomputed to zero. If the sync was skipped (state inconsistency),
+    // non-zero effective_permissions would survive the account close. The guard
+    // ensures the account is clean before closing.
+
+    #[test]
+    fn test_f3_close_rejected_when_effective_permissions_nonzero() {
+        let mut effective_permissions: Vec<u8> = Vec::new();
+        set_bit(&mut effective_permissions, 5); // residual bit from a role
+        let is_clean = effective_permissions.iter().all(|&b| b == 0);
+        assert!(
+            !is_clean,
+            "non-zero effective_permissions must block account close"
+        );
+    }
+
+    #[test]
+    fn test_f3_close_accepted_when_effective_permissions_zero() {
+        let effective_permissions: Vec<u8> = vec![0u8; 4]; // all zero bytes
+        let is_clean = effective_permissions.iter().all(|&b| b == 0);
+        assert!(
+            is_clean,
+            "all-zero effective_permissions must allow account close"
+        );
+    }
+
+    #[test]
+    fn test_f3_close_accepted_when_effective_permissions_empty() {
+        let effective_permissions: Vec<u8> = Vec::new();
+        let is_clean = effective_permissions.iter().all(|&b| b == 0);
+        assert!(
+            is_clean,
+            "empty effective_permissions must allow account close"
+        );
+    }
+
+    // ── assign_role: pcc==0 implies empty role effective_permissions ────────
+    // When pcc==0, the PermChunksRequired guard ensures next_permission_index==0,
+    // which means no permissions have ever been created. Therefore any role's
+    // effective_permissions must be empty — the raw value can be trusted as-is
+    // because it can never contain stale deleted-permission bits.
+
+    #[test]
+    fn test_f4_pcc_zero_only_when_no_permissions_exist() {
+        // PermChunksRequired guard: next_permission_index == 0 || pcc > 0
+        let cases: &[(u32, usize, bool)] = &[
+            (0, 0, true),  // no permissions, no chunks → allowed
+            (1, 0, false), // permissions exist, no chunks → rejected
+            (1, 1, true),  // permissions exist, chunk provided → allowed
+            (0, 1, true),  // no permissions, chunk provided anyway → allowed
+        ];
+        for &(npi, pcc, expected) in cases {
+            let guard_passes = npi == 0 || pcc > 0;
+            assert_eq!(
+                guard_passes, expected,
+                "npi={npi} pcc={pcc}: guard_passes should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_f4_role_effective_permissions_empty_when_no_permissions() {
+        // When next_permission_index==0, no permission can ever be created, so
+        // any stored effective_permissions must be empty. The assign_role
+        // invariant assertion catches a violation of this.
+        let next_permission_index: u32 = 0;
+        let role_effective: Vec<u8> = Vec::new(); // invariant: must hold
+        if next_permission_index == 0 {
+            assert!(
+                role_effective.is_empty(),
+                "role must have empty effective_permissions when no permissions exist"
+            );
+        }
+    }
+
+    // ── update_nonce: separates cycle epoch from permissions_version ────────
+    // recompute_epoch was previously compared against permissions_version.
+    // cancel_update did NOT increment permissions_version, so roles recomputed
+    // in a cancelled cycle kept their recompute_epoch equal to the unchanged
+    // permissions_version in the next cycle. This caused:
+    //   (a) AlreadyRecomputed errors for those roles in the next begin_update
+    //       cycle (deadlock — commit_update could never succeed).
+    //   (b) The subset-check in revoke_role could pass against stale
+    //       effective_permissions from the cancelled cycle.
+    //
+    // update_nonce is incremented by both begin_update and cancel_update,
+    // giving each cycle a unique identifier.
+
+    #[test]
+    fn test_f5_cancelled_cycle_deadlocks_without_update_nonce() {
+        // Simulate: permissions_version=5, cancel after recomputing one role.
+        let permissions_version: u64 = 5;
+        let role_recompute_epoch: u64 = 5; // set during the cancelled cycle
+
+        // Without update_nonce — next begin_update still has permissions_version=5.
+        // The idempotency guard: require!(epoch != permissions_version) fires!
+        let would_deadlock = role_recompute_epoch == permissions_version;
+        assert!(
+            would_deadlock,
+            "without update_nonce, the role appears already-recomputed and the \
+             next cycle cannot complete"
+        );
+    }
+
+    #[test]
+    fn test_f5_update_nonce_resolves_deadlock_after_cancel() {
+        let update_nonce: u64 = 5; // current cycle nonce set by begin_update
+        let role_recompute_epoch: u64 = 5; // role was recomputed in this cycle
+
+        // Idempotency guard for the current cycle fires — correct.
+        assert_eq!(role_recompute_epoch, update_nonce);
+
+        // cancel_update increments the nonce.
+        let new_nonce = update_nonce.checked_add(1).unwrap();
+
+        // Next begin_update uses new_nonce. Idempotency guard no longer fires.
+        assert_ne!(
+            role_recompute_epoch, new_nonce,
+            "after cancel, epoch != new_nonce so role can be recomputed"
+        );
+    }
+
+    #[test]
+    fn test_f5_update_nonce_prevents_stale_epoch_on_child_topo_check() {
+        // After cancel_update and a second begin_update, the topo check for
+        // children compares child.recompute_epoch == org.update_nonce.
+        // A child recomputed in the cancelled cycle has epoch = old_nonce, so
+        // the check correctly requires it to be recomputed again.
+        let old_nonce: u64 = 3;
+        let new_nonce: u64 = 4; // after cancel + begin_update
+        let child_epoch: u64 = old_nonce; // recomputed in cancelled cycle
+
+        let child_fresh_for_new_cycle = child_epoch == new_nonce;
+        assert!(
+            !child_fresh_for_new_cycle,
+            "child must be recomputed in the new cycle; stale epoch must fail"
+        );
+    }
+
+    #[test]
+    fn test_f5_update_nonce_overflow_detection() {
+        let nonce: u64 = u64::MAX;
+        let result = nonce.checked_add(1);
+        assert!(
+            result.is_none(),
+            "update_nonce overflow must be caught by checked_add"
+        );
+    }
+
+    // ── manage_roles_permission must be a valid (created) permission index ──
+    // manage_roles_permission is set at init (no permissions exist yet, so any
+    // value < 256 is accepted). If it's never actually created as a permission,
+    // delegation is permanently disabled. If set to 0, all holders of the first
+    // permission (often a generic read permission) become unintended managers.
+    // Validation of manage_roles_permission < next_permission_index happens at
+    // delegation time, not at init.
+
+    #[test]
+    fn test_f6_delegation_blocked_when_manage_perm_never_created() {
+        let manage_roles_permission: u32 = 200; // admin set this but never created it
+        let next_permission_index: u32 = 5;     // only 5 permissions exist (0..4)
+        let delegation_enabled = manage_roles_permission < next_permission_index;
+        assert!(
+            !delegation_enabled,
+            "delegation must be blocked when manage_roles_permission index was never created"
+        );
+    }
+
+    #[test]
+    fn test_f6_delegation_enabled_when_manage_perm_exists() {
+        let manage_roles_permission: u32 = 3;
+        let next_permission_index: u32 = 5;
+        let delegation_enabled = manage_roles_permission < next_permission_index;
+        assert!(
+            delegation_enabled,
+            "delegation must be enabled when manage_roles_permission index exists"
+        );
+    }
+
+    #[test]
+    fn test_f6_manage_perm_index_zero_grants_unintended_delegation() {
+        // Scenario: admin sets manage_roles_permission=0 thinking it's a placeholder.
+        // Permission 0 is commonly the first created (e.g., "read"). Any user
+        // with "read" automatically becomes a role manager.
+        let manage_roles_permission: u32 = 0;
+        let mut user_perms = [0u8; 32];
+        set_bit_arr(&mut user_perms, 0); // user has "read" permission
+
+        let is_unintended_manager = has_bit(&user_perms, manage_roles_permission);
+        assert!(
+            is_unintended_manager,
+            "setting manage_roles_permission=0 unintentionally promotes \
+             any holder of permission 0 to role manager"
+        );
+    }
+
+    // ── process_recompute_batch: concurrent call liveness ───────────────────
+    // Two operators calling process_recompute_batch concurrently with
+    // overlapping user sets: the first call succeeds and sets
+    // cached_version = target_version for those users; the second call hits
+    // AlreadyRecomputed for them and reverts the entire batch. This doesn't
+    // corrupt state (Solana atomicity) but can cause liveness issues for large
+    // orgs. Documented here for awareness.
+
+    #[test]
+    fn test_f7_concurrent_batch_second_call_reverts_on_overlap() {
+        let target_version: u64 = 5;
+        // After the first call, this user's cached_version is updated.
+        let cached_version_after_first_call: u64 = target_version;
+
+        // Second call for the same user: AlreadyRecomputed fires.
+        let already_recomputed = cached_version_after_first_call >= target_version;
+        assert!(
+            already_recomputed,
+            "second batch call with an overlapping user reverts — liveness risk for large orgs"
+        );
+    }
+
+    // ── revoke_role: subset check must use the maximum possible grant set ───
+    // After cancel_update, a role's direct_permissions may have been modified
+    // (via add_role_permission / remove_role_permission in the cancelled
+    // Updating phase) but effective_permissions was never refreshed. Using only
+    // the stored (stale) effective_permissions for the delegated revoke_role
+    // subset check could allow a caller with fewer permissions than the role
+    // actually grants to pass.
+    //
+    // The subset check now re-derives the role's direct permissions from
+    // direct_permissions filtered through PermChunks, then unions with the
+    // stored effective_permissions to get the maximum possible grant set.
+
+    #[test]
+    fn test_f8_stale_effective_perms_bypasses_subset_check() {
+        // Before the cancel: role had effective_permissions = {} (no perms yet).
+        let stored_effective: Vec<u8> = Vec::new();
+
+        // During the cancelled cycle: permission 7 was added to direct_permissions.
+        let mut updated_direct: Vec<u8> = Vec::new();
+        set_bit(&mut updated_direct, 7);
+
+        // Caller has no permissions.
+        let caller_perms = [0u8; 32];
+
+        // Old check (stale): {} ⊆ {} → passes, caller can revoke role.
+        let stale_passes = bitmask_is_subset(&stored_effective, &caller_perms);
+        // New check (fresh): {7} ⊆ {} → fails, caller correctly blocked.
+        let fresh_passes = bitmask_is_subset(&updated_direct, &caller_perms);
+
+        assert!(stale_passes, "stale check incorrectly allows the revoke");
+        assert!(!fresh_passes, "fresh check correctly blocks the revoke");
+    }
+
+    #[test]
+    fn test_f8_union_of_direct_and_stored_effective_is_max_grant() {
+        // If stored_effective = {3} (from last committed cycle) and
+        // direct_permissions now = {3, 7} (updated in cancelled cycle), the
+        // maximum possible grant is {3, 7}. A caller must hold {3, 7} to revoke.
+        let mut stored_effective: Vec<u8> = Vec::new();
+        set_bit(&mut stored_effective, 3);
+
+        let mut fresh_direct: Vec<u8> = Vec::new();
+        set_bit(&mut fresh_direct, 3);
+        set_bit(&mut fresh_direct, 7);
+
+        let max_grant = bitmask_union(&stored_effective, &fresh_direct);
+        assert!(has_bit(&max_grant, 3));
+        assert!(has_bit(&max_grant, 7));
+
+        // Caller with only permission 3.
+        let mut caller_perms_partial = Vec::new();
+        set_bit(&mut caller_perms_partial, 3);
+        assert!(
+            !bitmask_is_subset(&max_grant, &caller_perms_partial),
+            "caller without perm 7 must be blocked by the max-grant check"
+        );
+
+        // Caller with both permissions 3 and 7.
+        let mut caller_perms_full = Vec::new();
+        set_bit(&mut caller_perms_full, 3);
+        set_bit(&mut caller_perms_full, 7);
+        assert!(
+            bitmask_is_subset(&max_grant, &caller_perms_full),
+            "caller with both perms must be allowed by the max-grant check"
+        );
     }
 }

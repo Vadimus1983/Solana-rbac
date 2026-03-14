@@ -138,6 +138,24 @@ pub fn handler(
             RbacError::AlreadyRecomputed
         );
 
+        // Verify UPC PDA BEFORE any state writes ────────────────────────────
+        // All account-identity validations must precede all state mutations
+        // (defence-in-depth).  Deserialise the UPC here, check its PDA, and
+        // keep the handle for the write phase below.
+        let mut cache = {
+            let data = upc_info
+                .try_borrow_data()
+                .map_err(|_| error!(RbacError::MissingAuthProof))?;
+            UserPermCache::try_deserialize(&mut data.as_ref())
+                .map_err(|_| error!(RbacError::MissingAuthProof))?
+        };
+        let expected_upc_pda = Pubkey::create_program_address(
+            &[b"user_perm_cache", org_key.as_ref(), ua.user.as_ref(), &[cache.bump]],
+            ctx.program_id,
+        ).map_err(|_| error!(RbacError::MissingAuthProof))?;
+        require!(upc_info.key() == expected_upc_pda, RbacError::MissingAuthProof);
+        // ─────────────────────────────────────────────────────────────────
+
         // Recompute: filter direct_permissions (active only) ∪ each assigned role's effective_permissions.
         let mut result: Vec<u8> = Vec::new();
 
@@ -273,22 +291,8 @@ pub fn handler(
         ua.try_serialize(&mut cursor)?;
         drop(ua_data);
 
-        // Deserialize, update, and re-serialize the UserPermCache.
-        let mut cache = {
-            let data = upc_info
-                .try_borrow_data()
-                .map_err(|_| error!(RbacError::MissingAuthProof))?;
-            UserPermCache::try_deserialize(&mut data.as_ref())
-                .map_err(|_| error!(RbacError::MissingAuthProof))?
-        };
-
-        // Verify UPC PDA using the stored bump.
-        let expected_upc_pda = Pubkey::create_program_address(
-            &[b"user_perm_cache", org_key.as_ref(), ua.user.as_ref(), &[cache.bump]],
-            ctx.program_id,
-        ).map_err(|_| error!(RbacError::MissingAuthProof))?;
-        require!(upc_info.key() == expected_upc_pda, RbacError::MissingAuthProof);
-
+        // Update and re-serialize the UserPermCache (already deserialized and
+        // PDA-verified above).
         copy_to_fixed(&mut cache.effective_permissions, &ua.effective_permissions);
         // Only set bits for active roles — soft-deleted roles that remain in
         // ua.assigned_roles must not appear in effective_roles, otherwise

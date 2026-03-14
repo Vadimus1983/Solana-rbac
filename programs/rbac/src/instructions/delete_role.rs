@@ -46,8 +46,15 @@ pub fn handler(ctx: Context<DeleteRole>, role_index: u32) -> Result<()> {
     // Capture whether this role has already been recomputed in the current
     // update cycle BEFORE modifying the entry. If it hasn't, releasing its
     // pending slot allows commit_update to complete after the deletion.
+    // Compare against update_nonce (not permissions_version): recompute_role
+    // stamps entry.recompute_epoch with org.update_nonce since the fix that
+    // prevents cancel_update deadlocks.  permissions_version is only incremented
+    // at commit_update, so using it here would produce a false positive — the
+    // role would appear "already recomputed" in the new cycle even though it
+    // was stamped in the previous one, leaving roles_pending_recompute too high
+    // and causing commitUpdate to fail with UpdateIncomplete.
     let already_recomputed_this_cycle =
-        entry.recompute_epoch == ctx.accounts.organization.permissions_version;
+        entry.recompute_epoch == ctx.accounts.organization.update_nonce;
     entry.active = false;
     entry.direct_permissions.clear();
     entry.effective_permissions.clear();

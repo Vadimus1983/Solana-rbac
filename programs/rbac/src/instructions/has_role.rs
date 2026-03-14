@@ -40,8 +40,9 @@ pub fn handler(ctx: Context<HasRole>, role_index: u32) -> Result<()> {
 
     // Reject stale caches — a deleted role would still appear in effective_roles
     // until process_recompute_batch updates the cache.
+    // Strict equality: >= also accepts future-dated caches.
     require!(
-        cache.permissions_version >= ctx.accounts.organization.permissions_version,
+        cache.permissions_version == ctx.accounts.organization.permissions_version,
         RbacError::StalePermissions
     );
 

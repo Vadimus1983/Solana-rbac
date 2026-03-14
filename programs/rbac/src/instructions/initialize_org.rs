@@ -39,6 +39,7 @@ pub fn handler(ctx: Context<InitializeOrganization>, name: String, manage_roles_
     org.roles_pending_recompute = 0;
     org.users_pending_recompute = 0;
     org.manage_roles_permission = manage_roles_permission;
+    org.update_nonce = 0;
 
     emit!(OrgCreated {
         organization: org.key(),

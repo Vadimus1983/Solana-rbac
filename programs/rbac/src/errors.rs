@@ -136,4 +136,13 @@ pub enum RbacError {
     /// User still has direct permissions — revoke all before closing the account.
     #[msg("User still has direct permissions; revoke all before closing")]
     UserHasDirectPermissions,
+
+    /// User account still has non-zero effective_permissions despite having no roles
+    /// and no direct permissions — state inconsistency, cannot close.
+    #[msg("User account has residual effective permissions; sync state before closing")]
+    UserHasEffectivePermissions,
+
+    /// update_nonce wrapped around u64::MAX — extremely unlikely in practice.
+    #[msg("Update cycle nonce overflow")]
+    UpdateCycleNonceOverflow,
 }

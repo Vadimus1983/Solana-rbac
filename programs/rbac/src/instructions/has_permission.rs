@@ -37,8 +37,10 @@ pub fn handler(ctx: Context<HasPermission>, permission_index: u32) -> Result<()>
     let org = &ctx.accounts.organization;
     let cache = &ctx.accounts.user_perm_cache;
 
+    // Strict equality: >= also passes future-dated caches, which are a symptom
+    // of tampering and must not be accepted.
     require!(
-        cache.permissions_version >= org.permissions_version,
+        cache.permissions_version == org.permissions_version,
         RbacError::StalePermissions
     );
     require!(permission_index < 256, RbacError::InvalidPermissionIndex);
