@@ -13,8 +13,8 @@ Organisations, roles, permissions, and user accounts all live on-chain. Permissi
 - **Permission bitmask** — up to 256 permissions per org, stored as a compact `Vec<u8>` or fixed `[u8; 32]`
 - **Hot-path cache** — `UserPermCache` (145 bytes, fixed size) enables O(1) on-chain CPI checks
 - **Chunked storage** — roles split into 16-entry chunks, permissions into 32-entry chunks; accounts grow on demand via `realloc`
-- **Governed state machine** — schema changes are atomic: `begin_update → [edit] → commit_update → [recompute] → finish_update`
-- **Delegation** — any user holding permission index `3` (`MANAGE_ROLES`) can assign/revoke roles without being super_admin
+- **Governed state machine** — schema changes are atomic: `begin_update -> [edit] -> commit_update -> [recompute] -> finish_update`; `cancel_update` aborts at any stage
+- **Delegation** — any user holding the org's configurable `manage_roles_permission` can assign/revoke roles without being super_admin
 - **CPI-ready** — `has_permission` and `has_role` are callable from other programs with automatic TX revert on failure
 - **Demo resources** — built-in `Resource` account type shows permission-gated creation/deletion
 
@@ -67,8 +67,8 @@ Solana-rbac/
 ### Chunk index arithmetic
 
 ```
-Role N   → chunk[N / 16].entries[N % 16]   (ROLES_PER_CHUNK = 16)
-Perm N   → chunk[N / 32].entries[N % 32]   (PERMS_PER_CHUNK = 32)
+Role N   -> chunk[N / 16].entries[N % 16]   (ROLES_PER_CHUNK = 16)
+Perm N   -> chunk[N / 32].entries[N % 32]   (PERMS_PER_CHUNK = 32)
 ```
 
 ---
@@ -76,16 +76,19 @@ Perm N   → chunk[N / 32].entries[N % 32]   (PERMS_PER_CHUNK = 32)
 ## State Machine
 
 ```
-Idle ──(begin_update)──► Updating ──(commit_update)──► Recomputing ──(finish_update)──► Idle
+Idle --(begin_update)--> Updating --(commit_update)--> Recomputing --(finish_update)--> Idle
+                              |                              |
+                              +---(cancel_update)------------+--> Idle
 ```
 
 | State | Allowed operations |
 |-------|--------------------|
-| **Idle** | `create_user_account`, `assign_role`, `revoke_role`, `assign_user_permission`, `revoke_user_permission`, `has_role`, `has_permission`, `create_resource`, `delete_resource` |
+| **Idle** | `create_user_account`, `close_user_account`, `assign_role`, `revoke_role`, `assign_user_permission`, `revoke_user_permission`, `has_role`, `has_permission`, `create_resource`, `delete_resource`, `transfer_super_admin`, `update_manage_roles_permission` |
 | **Updating** | `create_role`, `delete_role`, `create_permission`, `delete_permission`, `add_role_permission`, `remove_role_permission`, `add_child_role`, `remove_child_role`, `recompute_role` |
 | **Recomputing** | `process_recompute_batch` |
+| **Updating or Recomputing** | `cancel_update` |
 
-`commit_update` bumps `Organization.permissions_version`, marking all cached user permissions as stale. `finish_update` returns to Idle after all user caches have been refreshed.
+`commit_update` bumps `Organization.permissions_version`, marking all cached user permissions as stale. `finish_update` returns to Idle after all user caches have been refreshed. `cancel_update` aborts an in-progress cycle and returns to Idle without advancing the version.
 
 ---
 
@@ -96,10 +99,12 @@ Idle ──(begin_update)──► Updating ──(commit_update)──► Recom
 | Instruction | Auth | Notes |
 |-------------|------|-------|
 | `initialize_organization(name, manage_roles_permission)` | Anyone | Caller becomes `super_admin`; `manage_roles_permission` is the permission index that allows assign/revoke roles |
-| `begin_update` | super_admin | Idle → Updating |
-| `commit_update` | super_admin | Updating → Recomputing, bumps version |
-| `finish_update` | super_admin | Recomputing → Idle |
+| `begin_update` | super_admin | Idle -> Updating |
+| `commit_update` | super_admin | Updating -> Recomputing, bumps version |
+| `finish_update` | super_admin | Recomputing -> Idle |
+| `cancel_update` | super_admin | Updating or Recomputing -> Idle (aborts cycle, does not bump version) |
 | `transfer_super_admin` | super_admin | Transfers super_admin to another signer (new admin must sign). Org PDA address unchanged (uses `original_admin`). |
+| `update_manage_roles_permission(new_index)` | super_admin | Changes which permission index grants delegation authority. The new index must refer to an existing permission. Idle state only. |
 
 ### Permissions (Updating state)
 
@@ -127,8 +132,9 @@ Idle ──(begin_update)──► Updating ──(commit_update)──► Recom
 | Instruction | Auth |
 |-------------|------|
 | `create_user_account` | super_admin |
-| `assign_role(role_index, perm_chunk_count)` | super_admin or holder of org’s `manage_roles_permission` |
-| `revoke_role(role_index, perm_chunk_count)` | super_admin or holder of org’s `manage_roles_permission` |
+| `close_user_account` | super_admin |
+| `assign_role(role_index, perm_chunk_count)` | super_admin or holder of org's `manage_roles_permission` |
+| `revoke_role(role_index, perm_chunk_count)` | super_admin or holder of org's `manage_roles_permission` |
 | `assign_user_permission(permission_index)` | super_admin |
 | `revoke_user_permission(permission_index, perm_chunk_count)` | super_admin |
 
@@ -154,13 +160,13 @@ Idle ──(begin_update)──► Updating ──(commit_update)──► Recom
 Permissions are stored as a compact byte array — bit `N` set means permission index `N` is granted.
 
 ```
-Byte 0 = indices 0–7
-Byte 1 = indices 8–15
+Byte 0 = indices 0-7
+Byte 1 = indices 8-15
 ...
 Byte k, bit b = index k*8 + b
 ```
 
-**Manage-roles permission:** Set per-org at `initialize_organization(name, manage_roles_permission)`. Holders of that index can assign/revoke roles (delegation). Convention is often index `3` (`MANAGE_ROLES`).
+**Manage-roles permission:** Set per-org at `initialize_organization` and updatable later via `update_manage_roles_permission`. Holders of that permission index can assign/revoke roles (delegation). Convention is often index `3` (`MANAGE_ROLES`), but the value is fully configurable.
 
 **Maximum:** 256 permissions per organisation (32-byte fixed cache).
 
