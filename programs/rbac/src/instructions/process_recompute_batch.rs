@@ -254,12 +254,10 @@ pub fn handler(
         let current_lamports = ua_info.lamports();
         if current_lamports < new_min {
             let diff = new_min - current_lamports;
-            // We cannot CPI directly from authority → ua_info because they come
-            // from different Context fields (accounts vs remaining_accounts) whose
-            // lifetimes the compiler treats as distinct in the #[program] macro
-            // dispatch. Instead we relay through the org account:
-            //   Step 1: CPI authority → org  (both in ctx.accounts, same 'info ✓)
-            //   Step 2: direct org → ua      (org is program-owned → can decrease ✓)
+            // Relay: authority → org (CPI, same 'info) → ua (direct, org is program-owned).
+            // The org balance is restored to its pre-relay value immediately after
+            // the direct transfer, so its rent-exemption is never compromised.
+            let org_lamports_before = org_account_info.lamports();
             anchor_lang::system_program::transfer(
                 CpiContext::new(
                     system_program_info.clone(),
@@ -272,11 +270,14 @@ pub fn handler(
             )?;
             **org_account_info.try_borrow_mut_lamports()? -= diff;
             **ua_info.try_borrow_mut_lamports()? += diff;
+            // Invariant: org balance unchanged after relay.
+            require!(
+                org_account_info.lamports() == org_lamports_before,
+                RbacError::MissingAuthProof
+            );
         }
         ua_info.resize(new_space)?;
-        // Reclaim excess lamports when UA shrinks (e.g. after a
-        // permission-deletion cycle reduces effective_permissions length).
-        // ua is program-owned (can decrease ✓); increasing authority is always OK ✓.
+        // Reclaim excess lamports when UA shrinks.
         let current_lamports_after = ua_info.lamports();
         if current_lamports_after > new_min {
             let excess = current_lamports_after - new_min;

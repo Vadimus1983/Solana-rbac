@@ -90,12 +90,15 @@ pub fn handler(ctx: Context<CreatePermission>, name: String, description: String
         init_chunk.try_serialize(&mut &mut data[..])?;
     }
 
-    // Deserialize the current chunk state (owner check when not init).
     require!(chunk_info.owner == ctx.program_id, RbacError::MissingAuthProof);
     let mut chunk = {
         let data = chunk_info.try_borrow_data()?;
         PermChunk::try_deserialize(&mut &data[..])?
     };
+    // Verify deserialized state matches expected identity — catches corrupted
+    // or re-initialized accounts that pass the owner + PDA seed checks.
+    require!(chunk.organization == ctx.accounts.organization.key(), RbacError::MissingAuthProof);
+    require!(chunk.chunk_index == chunk_idx, RbacError::MissingAuthProof);
 
     // Grow the account to fit the new entry.
     let current_len = chunk_info.data_len();

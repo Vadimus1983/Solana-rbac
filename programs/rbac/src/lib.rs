@@ -190,4 +190,11 @@ pub mod rbac {
     pub fn transfer_super_admin(ctx: Context<TransferSuperAdmin>) -> Result<()> {
         instructions::transfer_super_admin::handler(ctx)
     }
+
+    pub fn update_manage_roles_permission(
+        ctx: Context<UpdateManageRolesPermission>,
+        new_manage_roles_permission: u32,
+    ) -> Result<()> {
+        instructions::update_manage_roles_permission::handler(ctx, new_manage_roles_permission)
+    }
 }

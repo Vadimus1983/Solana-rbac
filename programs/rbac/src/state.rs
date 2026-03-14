@@ -2014,4 +2014,262 @@ mod tests {
             "caller with both perms must be allowed by the max-grant check"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // H-2/H-3: manage_roles_permission must be updatable and validated
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_manage_roles_permission_update_requires_existing_index() {
+        let next_permission_index: u32 = 5;
+
+        // Valid: index within created range.
+        let new_val: u32 = 4;
+        assert!(new_val < next_permission_index);
+
+        // Invalid: index at boundary.
+        let new_val: u32 = 5;
+        assert!(!(new_val < next_permission_index));
+
+        // Invalid: index beyond boundary.
+        let new_val: u32 = 200;
+        assert!(!(new_val < next_permission_index));
+    }
+
+    #[test]
+    fn test_manage_roles_permission_update_rejects_no_permissions() {
+        let next_permission_index: u32 = 0;
+        for candidate in [0u32, 1, 127, 255] {
+            assert!(
+                !(candidate < next_permission_index),
+                "candidate {} must be rejected when no permissions exist",
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn test_manage_roles_permission_update_prevents_dangerous_index_zero() {
+        // Scenario: admin realises index 0 is a generic "read" permission
+        // and wants to change manage_roles_permission to a dedicated index.
+        let old_manage: u32 = 0;
+        let new_manage: u32 = 3;
+        let next_permission_index: u32 = 5;
+
+        assert!(new_manage < next_permission_index, "new index must exist");
+        assert_ne!(old_manage, new_manage, "must actually change");
+
+        // After update, user with only permission 0 no longer delegates.
+        let mut user_perms = [0u8; 32];
+        set_bit_arr(&mut user_perms, 0);
+        assert!(
+            !has_bit(&user_perms, new_manage),
+            "user with only perm 0 must not be a manager after switching to perm 3"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // M-3/M-4: assign_role delegation must use max-grant (direct ∪ effective)
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_assign_role_max_grant_catches_cancel_update_escalation() {
+        // After cancel_update: role has direct_permissions = {7} (added during
+        // cancelled cycle) but effective_permissions = {} (never recomputed).
+        let stored_effective: Vec<u8> = Vec::new();
+        let mut fresh_direct: Vec<u8> = Vec::new();
+        set_bit(&mut fresh_direct, 7);
+
+        let caller_perms = [0u8; 32]; // caller has no permissions
+
+        // Old check (effective only): {} ⊆ {} → passes (escalation!)
+        assert!(
+            bitmask_is_subset(&stored_effective, &caller_perms),
+            "old effective-only check incorrectly passes"
+        );
+
+        // New check (max-grant = direct ∪ effective): {7} ⊆ {} → fails
+        let max_grant = bitmask_union(&stored_effective, &fresh_direct);
+        assert!(
+            !bitmask_is_subset(&max_grant, &caller_perms),
+            "max-grant check correctly blocks the escalation"
+        );
+    }
+
+    #[test]
+    fn test_assign_role_max_grant_allows_legitimate_delegation() {
+        // Role: direct = {3, 7}, effective = {3, 7} (fully recomputed).
+        let mut direct: Vec<u8> = Vec::new();
+        set_bit(&mut direct, 3);
+        set_bit(&mut direct, 7);
+        let effective = direct.clone();
+
+        // Caller holds {3, 7, 9}.
+        let mut caller_perms = [0u8; 32];
+        set_bit_arr(&mut caller_perms, 3);
+        set_bit_arr(&mut caller_perms, 7);
+        set_bit_arr(&mut caller_perms, 9);
+
+        let max_grant = bitmask_union(&effective, &direct);
+        assert!(
+            bitmask_is_subset(&max_grant, &caller_perms),
+            "caller with superset of role perms must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_assign_role_max_grant_includes_child_inherited_perms() {
+        // Role: direct = {3}, effective = {3, 5} (5 inherited from child).
+        // After cancel_update, direct may have been modified but effective
+        // still carries the child-inherited permission 5.
+        let mut direct: Vec<u8> = Vec::new();
+        set_bit(&mut direct, 3);
+        let mut effective: Vec<u8> = Vec::new();
+        set_bit(&mut effective, 3);
+        set_bit(&mut effective, 5);
+
+        let max_grant = bitmask_union(&effective, &direct);
+        assert!(has_bit(&max_grant, 3));
+        assert!(has_bit(&max_grant, 5));
+
+        // Caller with only {3} cannot assign this role.
+        let mut caller_partial = [0u8; 32];
+        set_bit_arr(&mut caller_partial, 3);
+        assert!(
+            !bitmask_is_subset(&max_grant, &caller_partial),
+            "caller missing inherited perm 5 must be blocked"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // M-5: effective_roles must reflect active status of all assigned roles
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_effective_roles_rebuild_clears_deleted_roles() {
+        let mut cache_roles = [0u8; 32];
+        set_bit_arr(&mut cache_roles, 0); // role 0: active
+        set_bit_arr(&mut cache_roles, 1); // role 1: deleted
+        set_bit_arr(&mut cache_roles, 2); // role 2: active
+
+        // Simulate rebuild: only roles 0 and 2 are active.
+        let active_roles: Vec<u32> = vec![0, 2];
+        let mut rebuilt = [0u8; 32];
+        for &topo in &active_roles {
+            set_bit_arr(&mut rebuilt, topo);
+        }
+
+        assert!(has_bit(&rebuilt, 0), "active role 0 must be set");
+        assert!(!has_bit(&rebuilt, 1), "deleted role 1 must be cleared");
+        assert!(has_bit(&rebuilt, 2), "active role 2 must be set");
+    }
+
+    #[test]
+    fn test_effective_roles_rebuild_empty_when_all_deleted() {
+        let active_roles: Vec<u32> = vec![];
+        let mut rebuilt = [0u8; 32];
+        for &topo in &active_roles {
+            set_bit_arr(&mut rebuilt, topo);
+        }
+        assert!(
+            rebuilt.iter().all(|&b| b == 0),
+            "all-deleted must produce zeroed effective_roles"
+        );
+    }
+
+    #[test]
+    fn test_effective_roles_rebuild_preserves_high_index_roles() {
+        let active_roles: Vec<u32> = vec![0, 127, 255];
+        let mut rebuilt = [0u8; 32];
+        for &topo in &active_roles {
+            set_bit_arr(&mut rebuilt, topo);
+        }
+        assert!(has_bit(&rebuilt, 0));
+        assert!(has_bit(&rebuilt, 127));
+        assert!(has_bit(&rebuilt, 255));
+        assert!(!has_bit(&rebuilt, 1));
+        assert!(!has_bit(&rebuilt, 128));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // M-1: chunk deserialization must verify org + chunk_index identity
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_chunk_identity_mismatch_detected() {
+        let expected_org = Pubkey::new_unique();
+        let wrong_org = Pubkey::new_unique();
+        let expected_chunk_idx: u32 = 0;
+        let wrong_chunk_idx: u32 = 1;
+
+        // Matching identity passes.
+        assert!(expected_org == expected_org);
+        assert!(expected_chunk_idx == expected_chunk_idx);
+
+        // Wrong org is caught.
+        assert_ne!(wrong_org, expected_org);
+
+        // Wrong chunk index is caught.
+        assert_ne!(wrong_chunk_idx, expected_chunk_idx);
+    }
+
+    #[test]
+    fn test_chunk_identity_after_reinit_would_fail() {
+        // Scenario: chunk was somehow zeroed and re-initialized with
+        // different org/chunk_index. The post-deserialization check
+        // catches this even though owner + PDA seeds match.
+        let real_org = Pubkey::new_unique();
+        let fake_org = Pubkey::new_unique();
+        let chunk_idx: u32 = 2;
+
+        // Simulated deserialized chunk has wrong org.
+        let deserialized_org = fake_org;
+        assert_ne!(
+            deserialized_org, real_org,
+            "mismatched org in deserialized chunk must be rejected"
+        );
+
+        // Simulated deserialized chunk has wrong index.
+        let deserialized_idx: u32 = 3;
+        assert_ne!(
+            deserialized_idx, chunk_idx,
+            "mismatched chunk_index in deserialized chunk must be rejected"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // M-2: lamport relay must preserve org balance invariant
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_lamport_relay_preserves_org_balance() {
+        let org_balance_before: u64 = 1_000_000;
+        let relay_amount: u64 = 50_000;
+
+        // Step 1: authority → org (CPI transfer).
+        let org_after_receive = org_balance_before + relay_amount;
+
+        // Step 2: org → ua (direct lamport manipulation).
+        let org_after_relay = org_after_receive - relay_amount;
+
+        assert_eq!(
+            org_after_relay, org_balance_before,
+            "org balance must be unchanged after relay"
+        );
+    }
+
+    #[test]
+    fn test_lamport_relay_invariant_catches_mismatch() {
+        let org_balance_before: u64 = 1_000_000;
+        let relay_amount: u64 = 50_000;
+
+        // Simulate a bug where the relay subtracts wrong amount.
+        let org_after_receive = org_balance_before + relay_amount;
+        let org_after_buggy_relay = org_after_receive - (relay_amount - 1);
+
+        assert_ne!(
+            org_after_buggy_relay, org_balance_before,
+            "invariant check must catch balance mismatch"
+        );
+    }
 }

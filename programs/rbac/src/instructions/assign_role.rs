@@ -213,13 +213,44 @@ pub fn handler(ctx: Context<AssignRole>, role_index: u32, perm_chunk_count: u8) 
         raw_effective
     };
 
-    // Delegated-path privilege-escalation guard: the role's effective permissions
-    // must be a subset of the caller's own permissions.  Without this check a
-    // delegated manager could assign (or later hold) permissions they were never
-    // explicitly granted.
+    // Delegated-path privilege-escalation guard: after cancel_update, a role's
+    // stored effective_permissions may not reflect direct_permissions changes
+    // made during the cancelled Updating phase. Re-derive direct permissions
+    // through PermChunks and union with stored effective_permissions to get the
+    // maximum possible grant set — same approach as revoke_role.
     if let Some(ref caller_perms) = caller_effective_perms {
+        let fresh_direct: Vec<u8> = if pcc > 0 {
+            let mut eff = Vec::new();
+            for (byte_idx, &byte) in entry.direct_permissions.iter().enumerate() {
+                if byte == 0 {
+                    continue;
+                }
+                for bit in 0..8u32 {
+                    if byte & (1 << bit) != 0 {
+                        let perm_idx_val = (byte_idx as u32) * 8 + bit;
+                        let perm_chunk_idx = perm_idx_val / PERMS_PER_CHUNK as u32;
+                        let perm_slot = perm_idx_val as usize % PERMS_PER_CHUNK;
+                        let perm_chunk = perm_index
+                            .as_ref()
+                            .and_then(|idx| idx.get(&perm_chunk_idx))
+                            .ok_or(RbacError::ChunkNotFound)?;
+                        if perm_slot < perm_chunk.entries.len()
+                            && perm_chunk.entries[perm_slot].index == perm_idx_val
+                            && perm_chunk.entries[perm_slot].active
+                        {
+                            set_bit(&mut eff, perm_idx_val);
+                        }
+                    }
+                }
+            }
+            eff
+        } else {
+            Vec::new()
+        };
+
+        let role_max_grant = bitmask_union(&entry_effective, &fresh_direct);
         require!(
-            bitmask_is_subset(&entry_effective, caller_perms),
+            bitmask_is_subset(&role_max_grant, caller_perms),
             RbacError::InsufficientPermission
         );
     }

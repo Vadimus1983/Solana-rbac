@@ -339,11 +339,26 @@ pub fn handler(ctx: Context<RevokeRole>, role_index: u32, perm_chunk_count: u8) 
         }
     }
 
-    // Sync UserPermCache.
+    // Sync UserPermCache — rebuild effective_roles from scratch so that
+    // soft-deleted roles don't retain stale bits between update cycles.
     let new_effective = ua.effective_permissions.clone();
     let cache = &mut ctx.accounts.user_perm_cache;
     copy_to_fixed(&mut cache.effective_permissions, &new_effective);
-    clear_bit_arr(&mut cache.effective_roles, role_index);
+    cache.effective_roles = [0u8; 32];
+    for role_ref in ua.assigned_roles.iter() {
+        let chunk_idx = role_ref.topo_index / ROLES_PER_CHUNK as u32;
+        let slot = role_ref.topo_index as usize % ROLES_PER_CHUNK;
+        let is_active = role_chunk_index
+            .get(&chunk_idx)
+            .map_or(false, |chunk| {
+                slot < chunk.entries.len()
+                    && chunk.entries[slot].topo_index == role_ref.topo_index
+                    && chunk.entries[slot].active
+            });
+        if is_active {
+            set_bit_arr(&mut cache.effective_roles, role_ref.topo_index);
+        }
+    }
     cache.permissions_version = org_permissions_version;
 
     emit!(RoleRevoked {
