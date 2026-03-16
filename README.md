@@ -323,6 +323,12 @@ If the user lacks the permission or their cache is stale, the CPI returns an err
 
 ---
 
+## Future Improvements
+
+- **`close_organization` instruction** — currently there is no way for a super_admin to close their organization and recover the SOL locked in its `Organization`, `RoleChunk`, and `PermChunk` accounts. If the program is ever deprecated or closed by the deployer, those rent deposits become permanently unrecoverable. A `close_organization` instruction should be added before mainnet deployment, requiring all user accounts to be closed first, then closing all chunks and the org account and returning rent to the super_admin.
+
+---
+
 ## License
 
 [MIT](LICENSE)
