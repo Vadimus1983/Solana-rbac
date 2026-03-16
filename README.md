@@ -205,6 +205,18 @@ VITE_CLUSTER=localnet                # localnet | devnet | mainnet-beta
 
 Tabs: **Overview** (org info + state machine controls) · **Permissions** · **Roles** · **Users**
 
+**Troubleshooting "Trying to access beyond buffer length"** — This usually means the validator has stale data from a previous program version. Reset and redeploy:
+
+```bash
+# In WSL: stop validator (Ctrl+C), then:
+rm -rf test-ledger
+solana-test-validator --rpc-bind-address 0.0.0.0   # if accessing from Windows
+# In another terminal:
+anchor build && anchor deploy
+```
+
+Then create a **new** organization in the admin panel (don't reuse old names from before the reset).
+
 ---
 
 ## Development

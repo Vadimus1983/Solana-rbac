@@ -107,7 +107,7 @@ export default function Overview({
     if (!wallet.publicKey) return;
     const program = getProgram(connection, wallet);
     runState("Begin Update", () =>
-      txBeginUpdate(program, orgName, wallet.publicKey!)
+      txBeginUpdate(program, orgData.originalAdmin, orgName, wallet.publicKey!)
     );
   };
 
@@ -115,7 +115,7 @@ export default function Overview({
     if (!wallet.publicKey) return;
     const program = getProgram(connection, wallet);
     runState("Commit Update", () =>
-      txCommitUpdate(program, orgName, wallet.publicKey!)
+      txCommitUpdate(program, orgData.originalAdmin, orgName, wallet.publicKey!)
     );
   };
 
@@ -123,7 +123,7 @@ export default function Overview({
     if (!wallet.publicKey) return;
     const program = getProgram(connection, wallet);
     runState("Finish Update", () =>
-      txFinishUpdate(program, orgName, wallet.publicKey!)
+      txFinishUpdate(program, orgData.originalAdmin, orgName, wallet.publicKey!)
     );
   };
 
@@ -144,17 +144,25 @@ export default function Overview({
       try {
         await txRecomputeRole(
           program,
+          orgData.originalAdmin,
           orgName,
           role.topoIndex,
           role.children,
           role.directPermissions,
-          wallet.publicKey!
+          wallet.publicKey!,
+          allRoles,
+          orgData.nextPermissionIndex
         );
       } catch (e: any) {
+        const msg: string = e?.message ?? "unknown";
+        if (msg.includes("AlreadyRecomputed")) {
+          // Role was already recomputed this cycle (e.g. via Roles tab) — skip.
+          continue;
+        }
         failed++;
         addToast({
           status: "error",
-          message: `Recompute role #${role.topoIndex} failed: ${e?.message ?? "unknown"}`,
+          message: `Recompute role #${role.topoIndex} failed: ${msg}`,
         });
       }
     }
@@ -170,7 +178,7 @@ export default function Overview({
   const handleRecomputeAllUsers = async () => {
     if (!wallet.publicKey) return;
     const program = getProgram(connection, wallet);
-    const [orgPda] = findOrgPda(orgName);
+    const [orgPda] = findOrgPda(orgData.originalAdmin, orgName);
 
     setRecomputingUsers(true);
     setUserProgress("Fetching user accounts…");
@@ -199,7 +207,7 @@ export default function Overview({
       const short = user.user.toBase58().slice(0, 6) + "…";
       setUserProgress(`User ${i + 1}/${users.length}: ${short}`);
       try {
-        await txProcessRecomputeUser(program, orgName, user, allRoles, wallet.publicKey!);
+        await txProcessRecomputeUser(program, orgData.originalAdmin, orgName, user, allRoles, wallet.publicKey!);
       } catch (e: any) {
         failed++;
         addToast({

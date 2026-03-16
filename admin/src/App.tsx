@@ -53,7 +53,7 @@ export default function App() {
     const id = addToast({ status: "pending", message: `Creating org "${name}"…` });
     try {
       const program = getProgram(connection, wallet);
-      const sig = await txInitializeOrg(program, name, wallet.publicKey);
+      const sig = await txInitializeOrg(program, name, wallet.publicKey, 0);
       updateToast(id, { status: "success", message: `Org "${name}" created`, txSig: sig });
       setOrgName(name);
       await refresh(name);
@@ -71,8 +71,8 @@ export default function App() {
     setNotFound(false);
     try {
       const program = getProgram(connection, wallet);
-      const org = await fetchOrg(program, name);
-      const [orgPda] = findOrgPda(name);
+      const org = await fetchOrg(program, wallet.publicKey!, name);
+      const [orgPda] = findOrgPda(org.originalAdmin, name);
       const roles = await fetchAllRoles(program, orgPda, org.roleCount);
       const perms = await fetchAllPerms(
         program,
@@ -87,6 +87,10 @@ export default function App() {
       if (msg.includes("does not exist") || msg.includes("Account does not exist")) {
         setNotFound(true);
         setError(null);
+      } else if (msg.includes("buffer") || msg.includes("Buffer") || msg.includes("borsh")) {
+        setError(
+          "Account data could not be decoded (schema mismatch). This often happens with stale validator data. Try: 1) Stop the validator (Ctrl+C), 2) Delete the test-ledger folder in WSL, 3) Restart solana-test-validator, 4) Run anchor build && anchor deploy, 5) Create a new organization."
+        );
       } else {
         setError(msg);
       }

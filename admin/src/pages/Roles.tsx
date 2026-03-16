@@ -85,6 +85,7 @@ export default function Roles({
     await run("Create Role", () =>
       txCreateRole(
         program,
+        orgData.originalAdmin,
         orgName,
         orgData.roleCount,
         wallet.publicKey!,
@@ -101,7 +102,7 @@ export default function Roles({
     if (!wallet.publicKey) return;
     const program = getProgram(connection, wallet);
     await run(`Delete Role #${role.topoIndex}`, () =>
-      txDeleteRole(program, orgName, role.topoIndex, wallet.publicKey!)
+      txDeleteRole(program, orgData.originalAdmin, orgName, role.topoIndex, wallet.publicKey!)
     );
   };
 
@@ -111,6 +112,7 @@ export default function Roles({
     await run(`Add Permission ${addPermIdx} to Role ${editRole.topoIndex}`, () =>
       txAddRolePermission(
         program,
+        orgData.originalAdmin,
         orgName,
         editRole.topoIndex,
         addPermIdx as number,
@@ -126,6 +128,7 @@ export default function Roles({
     await run(`Remove Permission ${permIdx} from Role ${editRole.topoIndex}`, () =>
       txRemoveRolePermission(
         program,
+        orgData.originalAdmin,
         orgName,
         editRole.topoIndex,
         permIdx,
@@ -140,6 +143,7 @@ export default function Roles({
     await run(`Add Child ${addChildIdx} to Role ${editRole.topoIndex}`, () =>
       txAddChildRole(
         program,
+        orgData.originalAdmin,
         orgName,
         editRole.topoIndex,
         addChildIdx as number,
@@ -155,6 +159,7 @@ export default function Roles({
     await run(`Remove Child ${childIdx} from Role ${editRole.topoIndex}`, () =>
       txRemoveChildRole(
         program,
+        orgData.originalAdmin,
         orgName,
         editRole.topoIndex,
         childIdx,
@@ -169,11 +174,14 @@ export default function Roles({
     await run(`Recompute Role ${editRole.topoIndex}`, () =>
       txRecomputeRole(
         program,
+        orgData.originalAdmin,
         orgName,
         editRole.topoIndex,
         editRole.children,
         editRole.directPermissions,
-        wallet.publicKey!
+        wallet.publicKey!,
+        allRoles,
+        orgData.nextPermissionIndex
       )
     );
   };

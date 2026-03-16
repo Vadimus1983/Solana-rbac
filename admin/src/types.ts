@@ -4,6 +4,7 @@ export type OrgStateKind = "idle" | "updating" | "recomputing";
 
 export interface OrgData {
   superAdmin: PublicKey;
+  originalAdmin: PublicKey;
   name: string;
   memberCount: bigint;
   nextPermissionIndex: number;
@@ -11,6 +12,7 @@ export interface OrgData {
   permissionsVersion: bigint;
   state: OrgStateKind;
   bump: number;
+  manageRolesPermission: number;
 }
 
 export interface RoleEntry {

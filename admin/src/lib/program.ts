@@ -17,7 +17,7 @@ import {
   roleChunkIndex,
   permChunkIndex,
 } from "./pda";
-import { ROLES_PER_CHUNK, PERMS_PER_CHUNK } from "./constants";
+import { PROGRAM_ID, ROLES_PER_CHUNK, PERMS_PER_CHUNK } from "./constants";
 import { bitmaskToIndices } from "./bitmask";
 
 // ---------------------------------------------------------------------------
@@ -88,14 +88,18 @@ function parseOrgState(raw: any): "idle" | "updating" | "recomputing" {
 // Fetch helpers
 // ---------------------------------------------------------------------------
 
-export async function fetchOrg(
-  program: Program,
-  orgName: string
-): Promise<OrgData> {
-  const [orgPda] = findOrgPda(orgName);
-  const raw = await (program.account as any).organization.fetch(orgPda);
+function toBytes(val: unknown): Uint8Array {
+  if (!val) return new Uint8Array(0);
+  if (val instanceof Uint8Array) return val;
+  if (Buffer.isBuffer(val)) return new Uint8Array(val);
+  if (Array.isArray(val)) return Uint8Array.from(val as number[]);
+  return new Uint8Array(0);
+}
+
+function rawToOrgData(raw: any): OrgData {
   return {
     superAdmin: raw.superAdmin as PublicKey,
+    originalAdmin: raw.originalAdmin as PublicKey,
     name: raw.name as string,
     memberCount: BigInt(raw.memberCount.toString()),
     nextPermissionIndex: raw.nextPermissionIndex as number,
@@ -103,7 +107,35 @@ export async function fetchOrg(
     permissionsVersion: BigInt(raw.permissionsVersion.toString()),
     state: parseOrgState(raw.state),
     bump: raw.bump as number,
+    manageRolesPermission: raw.manageRolesPermission as number,
   };
+}
+
+/**
+ * Fetch an organization by trying the connected wallet as original_admin first
+ * (fast path), then falling back to a getProgramAccounts search by name.
+ */
+export async function fetchOrg(
+  program: Program,
+  callerKey: PublicKey,
+  orgName: string
+): Promise<OrgData> {
+  // Fast path: caller is the original admin
+  try {
+    const [orgPda] = findOrgPda(callerKey, orgName);
+    const raw = await (program.account as any).organization.fetch(orgPda);
+    return rawToOrgData(raw);
+  } catch {
+    // Caller is not the original admin — search all org accounts by name
+  }
+
+  const all = await (program.account as any).organization.all();
+  for (const a of all) {
+    if ((a.account.name as string) === orgName) {
+      return rawToOrgData(a.account);
+    }
+  }
+  throw new Error("Account does not exist or has no data");
 }
 
 export async function fetchAllRoles(
@@ -124,11 +156,9 @@ export async function fetchAllRoles(
           version: BigInt((e.version as BN).toString()),
           name: e.name as string,
           description: e.description as string,
-          directPermissions: Uint8Array.from(e.directPermissions as number[]),
-          effectivePermissions: Uint8Array.from(
-            e.effectivePermissions as number[]
-          ),
-          children: e.children as number[],
+          directPermissions: toBytes(e.directPermissions),
+          effectivePermissions: toBytes(e.effectivePermissions),
+          children: (e.children as number[]) ?? [],
           active: e.active as boolean,
         });
       }
@@ -176,11 +206,12 @@ export async function fetchAllPerms(
 export async function txInitializeOrg(
   program: Program,
   orgName: string,
-  authority: PublicKey
+  authority: PublicKey,
+  manageRolesPermission: number
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(authority, orgName);
   return (program.methods as any)
-    .initializeOrganization(orgName)
+    .initializeOrganization(orgName, manageRolesPermission)
     .accounts({
       organization: orgPda,
       authority,
@@ -191,10 +222,11 @@ export async function txInitializeOrg(
 
 export async function txBeginUpdate(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   return (program.methods as any)
     .beginUpdate()
     .accounts({ organization: orgPda, authority })
@@ -203,10 +235,11 @@ export async function txBeginUpdate(
 
 export async function txCommitUpdate(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   return (program.methods as any)
     .commitUpdate()
     .accounts({ organization: orgPda, authority })
@@ -215,10 +248,11 @@ export async function txCommitUpdate(
 
 export async function txFinishUpdate(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   return (program.methods as any)
     .finishUpdate()
     .accounts({ organization: orgPda, authority })
@@ -227,13 +261,14 @@ export async function txFinishUpdate(
 
 export async function txCreatePermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   nextPermIndex: number,
   authority: PublicKey,
   name: string,
   description: string
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const chunkIdx = permChunkIndex(nextPermIndex);
   const [permChunkPda] = findPermChunkPda(orgPda, chunkIdx);
   return (program.methods as any)
@@ -249,11 +284,12 @@ export async function txCreatePermission(
 
 export async function txDeletePermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   permIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const chunkIdx = permChunkIndex(permIndex);
   const [permChunkPda] = findPermChunkPda(orgPda, chunkIdx);
   return (program.methods as any)
@@ -268,13 +304,14 @@ export async function txDeletePermission(
 
 export async function txCreateRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   roleCount: number,
   authority: PublicKey,
   name: string,
   description: string
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const chunkIdx = roleChunkIndex(roleCount);
   const [roleChunkPda] = findRoleChunkPda(orgPda, chunkIdx);
   return (program.methods as any)
@@ -290,11 +327,12 @@ export async function txCreateRole(
 
 export async function txDeleteRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   roleIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const chunkIdx = roleChunkIndex(roleIndex);
   const [roleChunkPda] = findRoleChunkPda(orgPda, chunkIdx);
   return (program.methods as any)
@@ -309,12 +347,13 @@ export async function txDeleteRole(
 
 export async function txAddRolePermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   roleIndex: number,
   permissionIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [roleChunkPda] = findRoleChunkPda(orgPda, roleChunkIndex(roleIndex));
   const [permChunkPda] = findPermChunkPda(orgPda, permChunkIndex(permissionIndex));
   return (program.methods as any)
@@ -331,12 +370,13 @@ export async function txAddRolePermission(
 
 export async function txRemoveRolePermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   roleIndex: number,
   permissionIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const chunkIdx = roleChunkIndex(roleIndex);
   const [roleChunkPda] = findRoleChunkPda(orgPda, chunkIdx);
   return (program.methods as any)
@@ -351,12 +391,13 @@ export async function txRemoveRolePermission(
 
 export async function txAddChildRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   parentIndex: number,
   childIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const parentChunkIdx = roleChunkIndex(parentIndex);
   const childChunkIdx = roleChunkIndex(childIndex);
   const [roleChunkPda] = findRoleChunkPda(orgPda, parentChunkIdx);
@@ -383,12 +424,13 @@ export async function txAddChildRole(
 
 export async function txRemoveChildRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   parentIndex: number,
   childIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const chunkIdx = roleChunkIndex(parentIndex);
   const [roleChunkPda] = findRoleChunkPda(orgPda, chunkIdx);
   return (program.methods as any)
@@ -403,20 +445,39 @@ export async function txRemoveChildRole(
 
 export async function txRecomputeRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   roleIndex: number,
   children: number[],
   directPermissions: Uint8Array,
-  authority: PublicKey
+  authority: PublicKey,
+  allRoles: RoleEntry[] = [],
+  nextPermissionIndex: number = 0
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const myChunkIdx = roleChunkIndex(roleIndex);
   const [roleChunkPda] = findRoleChunkPda(orgPda, myChunkIdx);
 
-  // Perm chunks for active-permission filtering (first in remaining_accounts)
+  // Collect perm chunk indices from this role's directPermissions AND from
+  // each child's effectivePermissions. The on-chain handler filters child bits
+  // through perm chunks when perm_chunk_count > 0, so all relevant chunks
+  // must be present in remaining_accounts.
   const uniquePermChunkIndices = new Set(
     bitmaskToIndices(directPermissions).map(permChunkIndex)
   );
+  for (const childIdx of children) {
+    const childRole = allRoles.find((r) => r.topoIndex === childIdx);
+    if (childRole && childRole.active) {
+      bitmaskToIndices(childRole.effectivePermissions).forEach((pi) =>
+        uniquePermChunkIndices.add(permChunkIndex(pi))
+      );
+    }
+  }
+  // On-chain check: perm_chunk_count must be > 0 when org has any permissions.
+  if (nextPermissionIndex > 0 && uniquePermChunkIndices.size === 0) {
+    uniquePermChunkIndices.add(0);
+  }
+
   const permChunkAccounts: AccountMeta[] = [];
   for (const ci of uniquePermChunkIndices) {
     const [pda] = findPermChunkPda(orgPda, ci);
@@ -468,8 +529,8 @@ export async function fetchAllUserAccounts(
         topoIndex: r.topoIndex as number,
         lastSeenVersion: BigInt((r.lastSeenVersion as BN).toString()),
       })),
-      directPermissions: Uint8Array.from(a.account.directPermissions as number[]),
-      effectivePermissions: Uint8Array.from(a.account.effectivePermissions as number[]),
+      directPermissions: toBytes(a.account.directPermissions),
+      effectivePermissions: toBytes(a.account.effectivePermissions),
       cachedVersion: BigInt((a.account.cachedVersion as BN).toString()),
       bump: a.account.bump as number,
     }));
@@ -486,12 +547,13 @@ export async function fetchAllUserAccounts(
  */
 export async function txProcessRecomputeUser(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   user: UserAccountData,
   allRoles: RoleEntry[],
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, user.user);
   const [userPermCachePda] = findUserPermCachePda(orgPda, user.user);
 
@@ -560,12 +622,12 @@ export async function fetchUserAccount(
     return {
       organization: raw.organization as PublicKey,
       user: raw.user as PublicKey,
-      assignedRoles: (raw.assignedRoles as any[]).map((r) => ({
+      assignedRoles: (raw.assignedRoles as any[] ?? []).map((r) => ({
         topoIndex: r.topoIndex as number,
         lastSeenVersion: BigInt((r.lastSeenVersion as BN).toString()),
       })),
-      directPermissions: Uint8Array.from(raw.directPermissions as number[]),
-      effectivePermissions: Uint8Array.from(raw.effectivePermissions as number[]),
+      directPermissions: toBytes(raw.directPermissions),
+      effectivePermissions: toBytes(raw.effectivePermissions),
       cachedVersion: BigInt((raw.cachedVersion as BN).toString()),
       bump: raw.bump as number,
     };
@@ -576,11 +638,12 @@ export async function fetchUserAccount(
 
 export async function txCreateUserAccount(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   return (program.methods as any)
@@ -598,13 +661,14 @@ export async function txCreateUserAccount(
 
 export async function txAssignRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   roleIndex: number,
   roleEffectivePermissions: Uint8Array,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   const [roleChunkPda] = findRoleChunkPda(orgPda, roleChunkIndex(roleIndex));
@@ -637,18 +701,19 @@ export async function txAssignRole(
 
 export async function txRevokeRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   roleIndex: number,
-  remainingRoleIndices: number[], // all roles the user will still have after revoke
-  directPermissions: Uint8Array,  // user's current direct_permissions bitmask
+  remainingRoleIndices: number[],
+  directPermissions: Uint8Array,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
+  const [roleChunkPda] = findRoleChunkPda(orgPda, roleChunkIndex(roleIndex));
 
-  // Perm chunks for filtering direct_permissions (first in remaining_accounts)
   const uniquePermChunkIndices = new Set(
     bitmaskToIndices(directPermissions).map(permChunkIndex)
   );
@@ -658,7 +723,6 @@ export async function txRevokeRole(
     permChunkAccounts.push({ pubkey: pda, isSigner: false, isWritable: false });
   }
 
-  // Role chunks for all remaining roles (after perm chunks)
   const uniqueRoleChunkIndices = new Set(remainingRoleIndices.map(roleChunkIndex));
   const roleChunkAccounts: AccountMeta[] = [];
   for (const ci of uniqueRoleChunkIndices) {
@@ -673,6 +737,7 @@ export async function txRevokeRole(
     .accounts({
       userAccount: userAccountPda,
       userPermCache: userPermCachePda,
+      roleChunk: roleChunkPda,
       organization: orgPda,
       authority,
       systemProgram: SystemProgram.programId,
@@ -683,12 +748,13 @@ export async function txRevokeRole(
 
 export async function txAssignUserPermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   permissionIndex: number,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   const [permChunkPda] = findPermChunkPda(orgPda, permChunkIndex(permissionIndex));
@@ -707,14 +773,15 @@ export async function txAssignUserPermission(
 
 export async function txRevokeUserPermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   permissionIndex: number,
-  assignedRoleIndices: number[], // all roles the user has (for recompute)
-  directPermissions: Uint8Array,  // user's current direct_permissions bitmask
+  assignedRoleIndices: number[],
+  directPermissions: Uint8Array,
   authority: PublicKey
 ): Promise<string> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userAccountPda] = findUserAccountPda(orgPda, userKey);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
 
@@ -763,11 +830,12 @@ export async function txRevokeUserPermission(
  *  Throws AnchorError with code "InsufficientPermission" or "StalePermissions". */
 export async function txHasPermission(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   permissionIndex: number
 ): Promise<void> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   await (program.methods as any)
     .hasPermission(permissionIndex)
@@ -784,11 +852,12 @@ export async function txHasPermission(
  *  Throws AnchorError with code "RoleNotAssigned" or "StalePermissions". */
 export async function txHasRole(
   program: Program,
+  originalAdmin: PublicKey,
   orgName: string,
   userKey: PublicKey,
   roleIndex: number
 ): Promise<void> {
-  const [orgPda] = findOrgPda(orgName);
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
   const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
   await (program.methods as any)
     .hasRole(roleIndex)
@@ -797,5 +866,162 @@ export async function txHasRole(
       user: userKey,
       userPermCache: userPermCachePda,
     })
+    .rpc();
+}
+
+// ---------------------------------------------------------------------------
+// Cancel update
+// ---------------------------------------------------------------------------
+
+export async function txCancelUpdate(
+  program: Program,
+  originalAdmin: PublicKey,
+  orgName: string,
+  authority: PublicKey
+): Promise<string> {
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
+  return (program.methods as any)
+    .cancelUpdate()
+    .accounts({ organization: orgPda, authority })
+    .rpc();
+}
+
+// ---------------------------------------------------------------------------
+// Close user account
+// ---------------------------------------------------------------------------
+
+export async function txCloseUserAccount(
+  program: Program,
+  originalAdmin: PublicKey,
+  orgName: string,
+  userKey: PublicKey,
+  authority: PublicKey
+): Promise<string> {
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
+  const [userAccountPda] = findUserAccountPda(orgPda, userKey);
+  const [userPermCachePda] = findUserPermCachePda(orgPda, userKey);
+  return (program.methods as any)
+    .closeUserAccount()
+    .accounts({
+      userAccount: userAccountPda,
+      userPermCache: userPermCachePda,
+      organization: orgPda,
+      authority,
+    })
+    .rpc();
+}
+
+// ---------------------------------------------------------------------------
+// Transfer super admin
+// ---------------------------------------------------------------------------
+
+export async function txTransferSuperAdmin(
+  program: Program,
+  originalAdmin: PublicKey,
+  orgName: string,
+  newSuperAdmin: PublicKey,
+  authority: PublicKey
+): Promise<string> {
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
+  return (program.methods as any)
+    .transferSuperAdmin()
+    .accounts({
+      organization: orgPda,
+      newSuperAdmin,
+      authority,
+    })
+    .rpc();
+}
+
+// ---------------------------------------------------------------------------
+// Update manage_roles_permission
+// ---------------------------------------------------------------------------
+
+export async function txUpdateManageRolesPermission(
+  program: Program,
+  originalAdmin: PublicKey,
+  orgName: string,
+  newManageRolesPermission: number,
+  authority: PublicKey
+): Promise<string> {
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
+  return (program.methods as any)
+    .updateManageRolesPermission(newManageRolesPermission)
+    .accounts({
+      organization: orgPda,
+      authority,
+    })
+    .rpc();
+}
+
+// ---------------------------------------------------------------------------
+// Demo resources
+// ---------------------------------------------------------------------------
+
+function findResourcePda(
+  orgKey: PublicKey,
+  creatorKey: PublicKey,
+  resourceId: bigint
+): [PublicKey, number] {
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64LE(resourceId, 0);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("resource"), orgKey.toBuffer(), creatorKey.toBuffer(), buf],
+    PROGRAM_ID
+  );
+}
+
+export async function txCreateResource(
+  program: Program,
+  originalAdmin: PublicKey,
+  orgName: string,
+  title: string,
+  resourceId: bigint,
+  requiredPermission: number,
+  authority: PublicKey
+): Promise<string> {
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
+  const [userPermCachePda] = findUserPermCachePda(orgPda, authority);
+  const [resourcePda] = findResourcePda(orgPda, authority, resourceId);
+  return (program.methods as any)
+    .createResource(title, new BN(resourceId.toString()), requiredPermission)
+    .accounts({
+      resource: resourcePda,
+      organization: orgPda,
+      userPermCache: userPermCachePda,
+      authority,
+      systemProgram: SystemProgram.programId,
+    })
+    .rpc();
+}
+
+export async function txDeleteResource(
+  program: Program,
+  originalAdmin: PublicKey,
+  orgName: string,
+  resourceCreator: PublicKey,
+  resourceId: bigint,
+  requiredPermission: number,
+  authority: PublicKey
+): Promise<string> {
+  const [orgPda] = findOrgPda(originalAdmin, orgName);
+  const [userPermCachePda] = findUserPermCachePda(orgPda, authority);
+  const [resourcePda] = findResourcePda(orgPda, resourceCreator, resourceId);
+
+  const [permChunkPda] = findPermChunkPda(orgPda, permChunkIndex(requiredPermission));
+  const remainingAccounts: AccountMeta[] = [
+    { pubkey: permChunkPda, isSigner: false, isWritable: false },
+  ];
+
+  return (program.methods as any)
+    .deleteResource()
+    .accounts({
+      resource: resourcePda,
+      organization: orgPda,
+      userPermCache: userPermCachePda,
+      authority,
+      resourceCreator,
+    })
+    .remainingAccounts(remainingAccounts)
     .rpc();
 }

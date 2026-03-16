@@ -1,9 +1,12 @@
 import { PublicKey } from "@solana/web3.js";
 import { PROGRAM_ID, ROLES_PER_CHUNK, PERMS_PER_CHUNK } from "./constants";
 
-export function findOrgPda(name: string): [PublicKey, number] {
+export function findOrgPda(
+  originalAdmin: PublicKey,
+  name: string
+): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from("organization"), Buffer.from(name)],
+    [Buffer.from("organization"), originalAdmin.toBuffer(), Buffer.from(name)],
     PROGRAM_ID
   );
 }

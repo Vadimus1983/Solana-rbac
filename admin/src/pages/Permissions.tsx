@@ -69,6 +69,7 @@ export default function Permissions({
     await run("Create Permission", () =>
       txCreatePermission(
         program,
+        orgData.originalAdmin,
         orgName,
         orgData.nextPermissionIndex,
         wallet.publicKey!,
@@ -103,6 +104,7 @@ export default function Permissions({
         () =>
           txRemoveRolePermission(
             program,
+            orgData.originalAdmin,
             orgName,
             role.topoIndex,
             confirmPerm.index,
@@ -119,7 +121,7 @@ export default function Permissions({
     // Step 2: soft-delete the permission
     setDeleteProgress("Deleting permission…");
     await run(`Delete Permission #${confirmPerm.index}`, () =>
-      txDeletePermission(program, orgName, confirmPerm.index, wallet.publicKey!)
+      txDeletePermission(program, orgData.originalAdmin, orgName, confirmPerm.index, wallet.publicKey!)
     );
 
     setDeleteProgress("");

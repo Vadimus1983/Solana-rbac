@@ -100,7 +100,7 @@ export default function Users({
 
     try {
       const program = getProgram(connection, wallet);
-      const [orgPda] = findOrgPda(orgName);
+      const [orgPda] = findOrgPda(orgData.originalAdmin, orgName);
       const ua = await fetchUserAccount(program, orgPda, userKey);
       if (ua) {
         setUserData(ua);
@@ -110,7 +110,7 @@ export default function Users({
     } finally {
       setLoadingUser(false);
     }
-  }, [wallet, connection, orgName, addToast]);
+  }, [wallet, connection, orgData, orgName, addToast]);
 
   const refreshUser = useCallback(async () => {
     if (userInput.trim()) await loadUser(userInput);
@@ -122,7 +122,7 @@ export default function Users({
     try { userKey = new PublicKey(userInput.trim()); } catch { return; }
     const program = getProgram(connection, wallet);
     const ok = await run("Create User Account", () =>
-      txCreateUserAccount(program, orgName, userKey, wallet.publicKey!)
+      txCreateUserAccount(program, orgData.originalAdmin, orgName, userKey, wallet.publicKey!)
     );
     if (ok) await refreshUser();
   };
@@ -133,7 +133,7 @@ export default function Users({
     const role = allRoles.find((r) => r.topoIndex === assignRoleIdx);
     const effectivePerms = role ? role.effectivePermissions : new Uint8Array();
     const ok = await run(`Assign Role #${assignRoleIdx}`, () =>
-      txAssignRole(program, orgName, userData.user, assignRoleIdx as number, effectivePerms, wallet.publicKey!)
+      txAssignRole(program, orgData.originalAdmin, orgName, userData.user, assignRoleIdx as number, effectivePerms, wallet.publicKey!)
     );
     if (ok) { setAssignRoleIdx(""); await refreshUser(); }
   };
@@ -145,7 +145,7 @@ export default function Users({
       .filter((i) => i !== roleIndex);
     const program = getProgram(connection, wallet);
     const ok = await run(`Revoke Role #${roleIndex}`, () =>
-      txRevokeRole(program, orgName, userData.user, roleIndex, remainingRoles, userData.directPermissions, wallet.publicKey!)
+      txRevokeRole(program, orgData.originalAdmin, orgName, userData.user, roleIndex, remainingRoles, userData.directPermissions, wallet.publicKey!)
     );
     if (ok) await refreshUser();
   };
@@ -154,7 +154,7 @@ export default function Users({
     if (!userData || assignPermIdx === "" || !wallet.publicKey) return;
     const program = getProgram(connection, wallet);
     const ok = await run(`Assign Permission #${assignPermIdx}`, () =>
-      txAssignUserPermission(program, orgName, userData.user, assignPermIdx as number, wallet.publicKey!)
+      txAssignUserPermission(program, orgData.originalAdmin, orgName, userData.user, assignPermIdx as number, wallet.publicKey!)
     );
     if (ok) { setAssignPermIdx(""); await refreshUser(); }
   };
@@ -164,7 +164,7 @@ export default function Users({
     const assignedRoleIndices = userData.assignedRoles.map((r) => r.topoIndex);
     const program = getProgram(connection, wallet);
     const ok = await run(`Revoke Permission #${permIndex}`, () =>
-      txRevokeUserPermission(program, orgName, userData.user, permIndex, assignedRoleIndices, userData.directPermissions, wallet.publicKey!)
+      txRevokeUserPermission(program, orgData.originalAdmin, orgName, userData.user, permIndex, assignedRoleIndices, userData.directPermissions, wallet.publicKey!)
     );
     if (ok) await refreshUser();
   };
@@ -175,7 +175,7 @@ export default function Users({
     setCheckRoleResult(null);
     try {
       const program = getProgram(connection, wallet);
-      await txHasRole(program, orgName, userData.user, checkRoleIdx as number);
+      await txHasRole(program, orgData.originalAdmin, orgName, userData.user, checkRoleIdx as number);
       setCheckRoleResult("ok");
     } catch (e: any) {
       const code: string = e?.error?.errorCode?.code ?? "";
@@ -193,7 +193,7 @@ export default function Users({
     setCheckPermResult(null);
     try {
       const program = getProgram(connection, wallet);
-      await txHasPermission(program, orgName, userData.user, checkPermIdx as number);
+      await txHasPermission(program, orgData.originalAdmin, orgName, userData.user, checkPermIdx as number);
       setCheckPermResult("ok");
     } catch (e: any) {
       const code: string = e?.error?.errorCode?.code ?? "";
