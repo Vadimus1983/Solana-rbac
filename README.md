@@ -1,5 +1,25 @@
 # Solana RBAC
 
+## Run Admin Panel locally (connected to Devnet)
+
+```bash
+cd admin
+npm install
+VITE_RPC_URL=https://api.devnet.solana.com VITE_CLUSTER=devnet npm run dev
+```
+
+Or on Windows (PowerShell):
+
+```powershell
+cd admin
+npm install
+$env:VITE_RPC_URL="https://api.devnet.solana.com"; $env:VITE_CLUSTER="devnet"; npm run dev
+```
+
+Open **http://localhost:5173** — connect Phantom/Solflare set to **Devnet**.
+
+---
+
 A production-grade **Role-Based Access Control** system implemented as a Solana on-chain program in Rust using the [Anchor](https://www.anchor-lang.com/) framework.
 
 Organisations, roles, permissions, and user accounts all live on-chain. Permission checks are a single bitmask read — O(1) regardless of how many roles a user holds.
@@ -25,7 +45,7 @@ Organisations, roles, permissions, and user accounts all live on-chain. Permissi
 | Network  | Program ID |
 |----------|------------|
 | Localnet | `H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf` |
-| Devnet   | `Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS` |
+| Devnet   | `H4yTMpUrSrb5Etr2FXhoC8NwaGaigLa2B3KpLZtnv9Lf` |
 
 ---
 
